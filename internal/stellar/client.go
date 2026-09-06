@@ -154,3 +154,12 @@ func describeHorizonError(err error) error {
 	}
 	return fmt.Errorf("%s (tx: %s, ops: %v)", hErr.Problem.Title, codes.TransactionCode, codes.OperationCodes)
 }
+
+// NetworkPassphrase returns the network this client signs for. Exposed so the
+// SEP-1 file and SEP-10 challenges cannot drift onto a different network from
+// the one settlement actually runs on.
+func (c *Client) NetworkPassphrase() string { return c.passphrase }
+
+// Horizon returns the underlying client, for callers that need account reads
+// this package does not wrap — SEP-10 signer lookups, in particular.
+func (c *Client) Horizon() *horizonclient.Client { return c.horizon }

@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: linq
+      POSTGRES_PASSWORD: linq
+      POSTGRES_DB: linq_stellar
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linq"]
+      interval: 5s
+      retries: 10
+
+  server:
+    build: .
+    command: server
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://linq:linq@db:5432/linq_stellar?sslmode=disable
+    ports: ["8080:8080"]
+    depends_on:
+      db: {condition: service_healthy}
+
+  worker:
+    build: .
+    command: worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://linq:linq@db:5432/linq_stellar?sslmode=disable
+    depends_on:
+      db: {condition: service_healthy}

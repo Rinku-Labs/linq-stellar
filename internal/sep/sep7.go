@@ -154,3 +154,32 @@ func formatAmount(v float64) string {
 	s = strings.TrimRight(s, "0")
 	return strings.TrimSuffix(s, ".")
 }
+
+// URISigner signs SEP-7 payment requests for one domain.
+//
+// A thin wrapper over the keypair so callers hold a signer rather than a raw
+// secret, and so a deployment without a signing key simply holds nil and emits
+// unsigned URIs instead of failing.
+type URISigner struct {
+	key *keypair.Full
+}
+
+// NewURISigner parses a signing seed. Its public half must be published as
+// URI_REQUEST_SIGNING_KEY in the stellar.toml, or wallets have nothing to
+// verify against and will treat signed requests as unverified anyway.
+func NewURISigner(seed string) (*URISigner, error) {
+	if seed == "" {
+		return nil, fmt.Errorf("sep7: signing seed is empty")
+	}
+	kp, err := keypair.ParseFull(seed)
+	if err != nil {
+		return nil, fmt.Errorf("sep7: invalid signing seed: %w", err)
+	}
+	return &URISigner{key: kp}, nil
+}
+
+// Address returns the public key to publish as URI_REQUEST_SIGNING_KEY.
+func (s *URISigner) Address() string { return s.key.Address() }
+
+// Sign appends a signature to a payment URI.
+func (s *URISigner) Sign(uri string) (string, error) { return Sign(uri, s.key) }
