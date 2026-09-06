@@ -24,16 +24,22 @@ startup; check the log line.
 migrates its own schema on boot.
 
 **4. `/internal/payout` deployed on the Linq backend, with a secret set.** The
-endpoint lives on branch `feature/stellar-internal-payout` (PR #44). It also
-needs `INTERNAL_API_SECRET` set on the backend, which it is not today — verified
-by the 503 that `/internal/status` currently returns. Until both are done,
-deposits are detected and swept correctly but **no Naira moves**.
+endpoint lives on branch `feature/stellar-internal-payout` (PR #44), which is
+**not deployed yet** — `POST /internal/payout` on the running backend answers
+`404`, the same as any path that was never registered. Separately,
+`INTERNAL_API_SECRET` is not set on the backend either: the pre-existing
+`POST /internal/status` route, which the same secret gates, currently answers
+`503 {"error":"Internal API not configured"}`, and no such secret exists in the
+Koyeb project at all. Both are needed — the route deployed and the secret set —
+before either endpoint will do anything. Until they are, deposits are detected
+and swept correctly but **no Naira moves**.
 
 ---
 
 ## Environment variables
 
-Both services take the same variables. Set them once per Koyeb service.
+Both services take the same variables, with one exception noted below. Set
+them once per Koyeb service.
 
 ### Required — the service refuses to start without these
 
@@ -45,6 +51,13 @@ Both services take the same variables. Set them once per Koyeb service.
 | `ENCRYPTION_KEY` | Encrypts deposit-account seeds at rest | Generate: `openssl rand -hex 16` (gives 32 chars) |
 | `LINQ_API_URL` | The Linq backend's base URL | `https://confidential-brianna-uselinq-52e2b233.koyeb.app` |
 | `LINQ_INTERNAL_SECRET` | Shared password with the Linq backend | Generate one, and set the **same value** as `INTERNAL_API_SECRET` on the Linq backend |
+| `ORDERS_API_KEY` | **`server` only.** Shared secret callers send as `X-API-Key` to `POST /orders` and `GET /orders/{id}` | Generate: `openssl rand -hex 32`, and give the same value to whatever calls this service to create orders |
+
+`ORDERS_API_KEY` guards the only two routes that cost the sponsor money
+(provisioning an account) or return order details — `/healthz`, the trustline
+preflight, `stellar.toml` and SEP-10 all stay open to anyone, as designed. The
+`worker` binary never serves HTTP, so it neither needs nor reads this
+variable; setting it there is harmless but does nothing.
 
 Missing variables are all reported at once on the first boot, not one per
 restart.
@@ -56,16 +69,19 @@ A shared password between two of your own servers, nothing more.
 This service asks the Linq backend to pay a merchant in Naira. That endpoint
 moves money, so it demands a secret header and ignores callers without it.
 
-**The Linq backend does not have this set yet.** Its `/internal` routes exist in
-code but `INTERNAL_API_SECRET` is unset in the deployment, so every request to
-them currently returns:
+**The Linq backend has neither the route nor the secret yet.** PR #44 is not in
+the running deployment, so `POST /internal/payout` doesn't exist there and
+returns `404`. The secret is also unset — no `INTERNAL_API_SECRET` exists in
+the Koyeb project — which is visible today on the older `POST /internal/status`
+route, already deployed and gated by the same variable:
 
 ```
 HTTP 503  {"error":"Internal API not configured"}
 ```
 
-Nothing calls those routes today, so nothing is broken by that — but the payout
-endpoint will answer 503 the same way until the variable is set.
+Nothing calls either route today, so nothing is broken by that. Once PR #44 is
+deployed, `/internal/payout` will answer the same 503 until the variable is
+set too.
 
 **You choose the value.** Generate one and set it in two places:
 
@@ -199,6 +215,8 @@ unfunded sponsor or a mismatched internal secret shows up.
 | Symptom | Cause |
 |---|---|
 | Exits immediately, lists several variables | Config validation. It reports every missing variable at once — fix them together |
+| `server` exits with `ORDERS_API_KEY is required` | Not set on the `server` service. The `worker` never hits this check — it doesn't serve HTTP |
+| `POST /orders` or `GET /orders/{id}` returns 401 | `X-API-Key` is missing or doesn't match `ORDERS_API_KEY` |
 | `encryption key must be 16, 24 or 32 bytes` | `ENCRYPTION_KEY` is the wrong length. `openssl rand -hex 16` |
 | `invalid sponsor seed` | You set a public key (`G...`) where a secret seed (`S...`) belongs |
 | Payouts fail with 503 `Internal API not configured` | `INTERNAL_API_SECRET` is not set on the Linq backend |

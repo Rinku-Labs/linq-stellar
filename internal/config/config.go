@@ -36,6 +36,12 @@ type Config struct {
 	LinqAPIURL    string
 	LinqAPISecret string
 
+	// OrdersAPIKey guards POST /orders and GET /orders/{id} — the only routes
+	// that create a deposit account or read one back. Left optional here
+	// because the worker binary shares this struct and never serves HTTP; the
+	// server binary is the one that requires it before it will listen.
+	OrdersAPIKey string
+
 	HomeDomain       string
 	WebAuthDomain    string
 	SEP10SigningKey  string
@@ -66,6 +72,7 @@ func Load() (Config, error) {
 		EncryptionKey:     []byte(os.Getenv("ENCRYPTION_KEY")),
 		LinqAPIURL:        os.Getenv("LINQ_API_URL"),
 		LinqAPISecret:     os.Getenv("LINQ_INTERNAL_SECRET"),
+		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
 		HomeDomain:        os.Getenv("SEP10_HOME_DOMAIN"),
 		WebAuthDomain:     env("SEP10_WEB_AUTH_DOMAIN", os.Getenv("SEP10_HOME_DOMAIN")),
 		SEP10SigningKey:   os.Getenv("SEP10_SIGNING_KEY"),

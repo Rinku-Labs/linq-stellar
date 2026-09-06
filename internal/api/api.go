@@ -3,6 +3,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,30 @@ type Server struct {
 	// URISigner signs SEP-7 payment requests. Optional: unsigned URIs still
 	// work, wallets just show them as unverified.
 	URISigner *sep.URISigner
-	Log       *slog.Logger
+	// OrdersAPIKey guards order creation and lookup. Every other route stays
+	// open: the toml and trustline preflight are meant for anyone to call, and
+	// SEP-10 is its own authentication. Required by cmd/server before it will
+	// listen — never zero-value in a running server.
+	OrdersAPIKey string
+	Log          *slog.Logger
+}
+
+// requireAPIKey wraps a handler with the shared-secret check for order routes.
+//
+// Without this, POST /orders is a free way to make the sponsor pay reserves
+// for an account nobody ever funds — cheap to spam, and each one sits there
+// until its deposit window expires. The comparison is constant-time so a
+// caller cannot learn the key one byte at a time from response latency.
+func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provided := r.Header.Get("X-API-Key")
+		if provided == "" ||
+			subtle.ConstantTimeCompare([]byte(provided), []byte(s.OrdersAPIKey)) != 1 {
+			writeError(w, http.StatusUnauthorized, "invalid or missing X-API-Key")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Routes returns the service's HTTP handler.
@@ -49,8 +73,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /sep10/auth", s.handleVerify)
 
 	mux.HandleFunc("GET /stellar/trustline", s.handleTrustline)
-	mux.HandleFunc("POST /orders", s.handleCreateOrder)
-	mux.HandleFunc("GET /orders/{id}", s.handleOrderStatus)
+	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
+	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
 
 	return logRequests(s.Log, mux)
 }

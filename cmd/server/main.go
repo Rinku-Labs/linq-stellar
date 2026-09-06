@@ -34,6 +34,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Only the server binary serves HTTP, so this is enforced here rather than
+	// in config.Load(): the worker shares that struct and would otherwise be
+	// blocked from starting by a key it never uses.
+	if cfg.OrdersAPIKey == "" {
+		return errors.New("config: ORDERS_API_KEY is required")
+	}
 	log := newLogger(cfg.LogLevel)
 
 	db, err := openDB(cfg.DatabaseURL)
@@ -62,6 +68,7 @@ func run() error {
 		Chain:         chain,
 		HomeDomain:    cfg.HomeDomain,
 		DepositWindow: cfg.DepositWindow,
+		OrdersAPIKey:  cfg.OrdersAPIKey,
 		Log:           log,
 	}
 

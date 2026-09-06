@@ -44,6 +44,7 @@ func testServer(t *testing.T) (*Server, *gorm.DB) {
 		Chain:         chain,
 		HomeDomain:    "linqswitch.xyz",
 		DepositWindow: 30 * time.Minute,
+		OrdersAPIKey:  "test-orders-key",
 		TOML: sep.TOMLConfig{
 			NetworkPassphrase: "Public Global Stellar Network ; September 2015",
 			OrgName:           "Linq",
@@ -53,6 +54,9 @@ func testServer(t *testing.T) (*Server, *gorm.DB) {
 	}, db
 }
 
+// do sends the request with the test server's own API key attached, which is
+// what every order-route test below exercises. TestOrdersRequireAPIKey checks
+// the case where that header is wrong or missing.
 func do(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r *http.Request
@@ -61,6 +65,7 @@ func do(t *testing.T, s *Server, method, path, body string) *httptest.ResponseRe
 	} else {
 		r = httptest.NewRequest(method, path, strings.NewReader(body))
 	}
+	r.Header.Set("X-API-Key", s.OrdersAPIKey)
 	w := httptest.NewRecorder()
 	s.Routes().ServeHTTP(w, r)
 	return w
@@ -108,6 +113,53 @@ func TestTrustlineRequiresAddress(t *testing.T) {
 	s, _ := testServer(t)
 	if got := do(t, s, http.MethodGet, "/stellar/trustline", "").Code; got != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", got)
+	}
+}
+
+// Order creation and lookup are the only routes that cost the sponsor money or
+// return account details, so they are the only ones gated on the shared key.
+func TestOrdersRequireAPIKey(t *testing.T) {
+	s, db := testServer(t)
+	db.Create(&store.Order{
+		ID:             "order-locked",
+		IdempotencyKey: "key-locked",
+		Status:         store.StateAwaitingDeposit,
+		DepositAddress: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+	})
+
+	unauth := func(method, path, body, apiKey string) int {
+		var r *http.Request
+		if body == "" {
+			r = httptest.NewRequest(method, path, nil)
+		} else {
+			r = httptest.NewRequest(method, path, strings.NewReader(body))
+		}
+		if apiKey != "" {
+			r.Header.Set("X-API-Key", apiKey)
+		}
+		w := httptest.NewRecorder()
+		s.Routes().ServeHTTP(w, r)
+		return w.Code
+	}
+
+	createBody := `{"idempotencyKey":"key-locked-2","amountNgn":2000,"rate":1655,"bankCode":"033","bankAccount":"1234567890"}`
+	for name, code := range map[string]int{
+		"missing key on create": unauth(http.MethodPost, "/orders", createBody, ""),
+		"wrong key on create":   unauth(http.MethodPost, "/orders", createBody, "not-the-key"),
+		"missing key on status": unauth(http.MethodGet, "/orders/order-locked", "", ""),
+		"wrong key on status":   unauth(http.MethodGet, "/orders/order-locked", "", "not-the-key"),
+	} {
+		if code != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, code)
+		}
+	}
+
+	// Every other route stays open — this is not a blanket auth wall.
+	if got := unauth(http.MethodGet, "/healthz", "", ""); got != http.StatusOK {
+		t.Errorf("healthz status = %d, want 200 without a key", got)
+	}
+	if got := unauth(http.MethodGet, "/stellar/trustline", "", ""); got != http.StatusBadRequest {
+		t.Errorf("trustline status = %d, want 400 (missing address) without a key", got)
 	}
 }
 
