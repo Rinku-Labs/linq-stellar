@@ -23,9 +23,11 @@ startup; check the log line.
 **3. A Postgres database.** Koyeb's managed Postgres is fine. The service
 migrates its own schema on boot.
 
-**4. `/internal/payout` deployed on the Linq backend.** It lives on branch
-`feature/stellar-internal-payout`. Until it ships, deposits are detected and
-swept correctly but **no Naira moves** — every payout attempt 404s.
+**4. `/internal/payout` deployed on the Linq backend, with a secret set.** The
+endpoint lives on branch `feature/stellar-internal-payout` (PR #44). It also
+needs `INTERNAL_API_SECRET` set on the backend, which it is not today — verified
+by the 503 that `/internal/status` currently returns. Until both are done,
+deposits are detected and swept correctly but **no Naira moves**.
 
 ---
 
@@ -42,7 +44,7 @@ Both services take the same variables. Set them once per Koyeb service.
 | `STELLAR_TREASURY_WALLET` | Treasury **public** key (`G...`) | The account with the USDC trustline |
 | `ENCRYPTION_KEY` | Encrypts deposit-account seeds at rest | Generate: `openssl rand -hex 16` (gives 32 chars) |
 | `LINQ_API_URL` | The Linq backend's base URL | `https://confidential-brianna-uselinq-52e2b233.koyeb.app` |
-| `LINQ_INTERNAL_SECRET` | Shared password with the Linq backend | **Copy `INTERNAL_API_SECRET` from the Linq backend's Koyeb env** |
+| `LINQ_INTERNAL_SECRET` | Shared password with the Linq backend | Generate one, and set the **same value** as `INTERNAL_API_SECRET` on the Linq backend |
 
 Missing variables are all reported at once on the first boot, not one per
 restart.
@@ -52,19 +54,33 @@ restart.
 A shared password between two of your own servers, nothing more.
 
 This service asks the Linq backend to pay a merchant in Naira. That endpoint
-moves money, so it demands a secret header and ignores callers without it. The
-Linq backend already has that secret as `INTERNAL_API_SECRET` — it guards
-`/internal/status` today.
+moves money, so it demands a secret header and ignores callers without it.
 
-**Do not generate a new value.** Copy the existing one:
+**The Linq backend does not have this set yet.** Its `/internal` routes exist in
+code but `INTERNAL_API_SECRET` is unset in the deployment, so every request to
+them currently returns:
 
 ```
-Linq backend                   Stellar service
-INTERNAL_API_SECRET=abc123  →  LINQ_INTERNAL_SECRET=abc123
+HTTP 503  {"error":"Internal API not configured"}
+```
+
+Nothing calls those routes today, so nothing is broken by that — but the payout
+endpoint will answer 503 the same way until the variable is set.
+
+**You choose the value.** Generate one and set it in two places:
+
+```bash
+openssl rand -hex 32
+```
+
+```
+Linq backend (Koyeb)           Stellar service (Koyeb)
+INTERNAL_API_SECRET=<value>    LINQ_INTERNAL_SECRET=<same value>
 ```
 
 Two names for one string, because each service names it from its own side. If
-they differ, every payout returns 401 and no Naira moves.
+they differ, every payout returns 401. If the backend's is missing entirely,
+every payout returns 503.
 
 #### About `ENCRYPTION_KEY`
 
@@ -185,6 +201,7 @@ unfunded sponsor or a mismatched internal secret shows up.
 | Exits immediately, lists several variables | Config validation. It reports every missing variable at once — fix them together |
 | `encryption key must be 16, 24 or 32 bytes` | `ENCRYPTION_KEY` is the wrong length. `openssl rand -hex 16` |
 | `invalid sponsor seed` | You set a public key (`G...`) where a secret seed (`S...`) belongs |
+| Payouts fail with 503 `Internal API not configured` | `INTERNAL_API_SECRET` is not set on the Linq backend |
 | Payouts fail with 401 | `LINQ_INTERNAL_SECRET` does not match the backend's `INTERNAL_API_SECRET` |
 | Payouts fail with 404 | `/internal/payout` is not deployed on the Linq backend yet |
 | `treasury has no USDC trustline` | Add the trustline before taking payments |
