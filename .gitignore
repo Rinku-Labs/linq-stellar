@@ -1,0 +1,16 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/bin/
+linq-stellar
+*.exe
+*.log
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
