@@ -32,9 +32,18 @@ NGN payout is delegated to the Linq B2B API over two internal endpoints
 cannot serve this: it mints its own deposit wallet and waits for a deposit,
 which is precisely the half this service has already done.
 
+Those endpoints are implemented in the Linq backend on branch
+`feature/stellar-internal-payout`. They reuse the existing multi-provider
+payout stack rather than duplicating bank integration here, which is why this
+repository holds no bank or partner credentials.
+
 ## Not in this repo
 
-- **Stellar Wallets Kit** — browser-side by nature; lives in the Linq B2B frontend.
+- **Stellar Wallets Kit** — browser-side by nature. Implemented in the Linq B2B
+  frontend on branch `feature/stellar-wallets-kit`: payers can connect
+  Freighter, xBull or Albedo at checkout and sign the USDC payment in place,
+  alongside the SEP-7 QR and copyable address that most volume still arrives
+  through.
 - **Chain indexing framework** — deposit detection here is purpose-built against
   Horizon. The multi-chain indexer Linq runs elsewhere is third-party open
   source and is not represented as Linq's work.
