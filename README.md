@@ -72,6 +72,9 @@ go run ./cmd/worker
 Requires PostgreSQL. `STELLAR_SPONSOR_KEY` must belong to a funded account, and
 `STELLAR_TREASURY_WALLET` must already hold a USDC trustline.
 
+For deploying to Koyeb — every environment variable, what to set it to, and how
+to verify the first real payment — see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## SCF reviewers
 
 [`docs/scf-criteria.md`](docs/scf-criteria.md) maps each tranche acceptance
