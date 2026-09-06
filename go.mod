@@ -1,4 +1,4 @@
-module github.com/uselinq/linq-stellar
+module github.com/Rinku-Labs/linq-stellar
 
 go 1.25.0
 

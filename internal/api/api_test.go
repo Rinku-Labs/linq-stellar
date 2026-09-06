@@ -12,9 +12,9 @@ import (
 
 	"github.com/glebarez/sqlite"
 	"github.com/stellar/go-stellar-sdk/keypair"
-	"github.com/uselinq/linq-stellar/internal/sep"
-	"github.com/uselinq/linq-stellar/internal/stellar"
-	"github.com/uselinq/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/sep"
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
+	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )

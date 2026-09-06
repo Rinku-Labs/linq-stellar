@@ -15,11 +15,11 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/uselinq/linq-stellar/internal/config"
-	"github.com/uselinq/linq-stellar/internal/payout"
-	"github.com/uselinq/linq-stellar/internal/settle"
-	"github.com/uselinq/linq-stellar/internal/stellar"
-	"github.com/uselinq/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/config"
+	"github.com/Rinku-Labs/linq-stellar/internal/payout"
+	"github.com/Rinku-Labs/linq-stellar/internal/settle"
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
+	"github.com/Rinku-Labs/linq-stellar/internal/store"
 )
 
 func main() {

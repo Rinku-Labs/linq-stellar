@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/uselinq/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 )
 

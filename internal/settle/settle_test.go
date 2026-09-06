@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
-	"github.com/uselinq/linq-stellar/internal/stellar"
-	"github.com/uselinq/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
+	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )

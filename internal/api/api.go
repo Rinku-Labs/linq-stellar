@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/uselinq/linq-stellar/internal/sep"
-	"github.com/uselinq/linq-stellar/internal/stellar"
-	"github.com/uselinq/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/sep"
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
+	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 )
 
