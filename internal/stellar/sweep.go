@@ -70,7 +70,13 @@ func (c *Client) Sweep(encryptedSeed, destination string, expected float64) (str
 	if err != nil {
 		return "", err
 	}
-	c.log.Info("swept usdc to treasury and closed deposit account",
+	// Deliberately neutral about where the funds went: this is a primitive that
+	// both the treasury sweep and the refund call, so naming either one here is
+	// wrong half the time. It said "to treasury" and so logged a refund to the
+	// payer as a treasury sweep — during an incident that reads as the money
+	// going two places when only one transaction exists. The callers log the
+	// meaning ("settled in treasury", "refunded to payer"); this logs the fact.
+	c.log.Info("swept usdc and closed deposit account",
 		"account", orderKp.Address(), "destination", destination, "amount", onChain, "tx", hash)
 	return hash, nil
 }
