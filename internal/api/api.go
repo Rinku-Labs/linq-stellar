@@ -76,12 +76,46 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
 
-	return logRequests(s.Log, mux)
+	// Preflight for the routes browsers call cross-origin. Registered
+	// explicitly because ServeMux matches on method, so an OPTIONS request
+	// would otherwise fall through to 405 and the real request never happens.
+	mux.HandleFunc("OPTIONS /", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	return withCORS(logRequests(s.Log, mux))
+}
+
+// withCORS lets browser clients call this service cross-origin.
+//
+// SEP-10 exists to be called from a wallet or a web app on another domain —
+// that is the whole point of publishing WEB_AUTH_ENDPOINT in a stellar.toml for
+// others to discover. Without these headers the browser blocks the response
+// before any application code sees it, and the caller gets an opaque "failed to
+// fetch" that says nothing about why.
+//
+// The origin is open because the endpoints behind it are either public
+// (stellar.toml, SEP-10 challenges, trustline lookups) or independently
+// authenticated by an API key that a browser on another origin does not hold.
+// Allowing the origin does not grant access; it only allows the reply to be
+// read.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleTOML(w http.ResponseWriter, r *http.Request) {
-	// Wallets fetch this cross-origin, so it has to be readable from anywhere.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// CORS is applied for every route by withCORS.
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, s.TOML.RenderTOML())

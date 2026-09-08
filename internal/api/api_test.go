@@ -279,3 +279,37 @@ func TestTerminalOrderHasNoPaymentURI(t *testing.T) {
 		t.Error("a settled order still advertised a payment uri")
 	}
 }
+
+// Browsers block a cross-origin response before any application code sees it,
+// and the caller gets an opaque "failed to fetch". SEP-10 is called from other
+// origins by design, so these headers are load-bearing rather than incidental.
+func TestCORSHeadersOnBrowserFacingRoutes(t *testing.T) {
+	s, _ := testServer(t)
+	for _, path := range []string{
+		"/.well-known/stellar.toml",
+		"/sep10/auth?account=GB2LEGZMXI44AMJNEM5RRWXB7YWUGSKRZJDJPMS2APJVNGMHTOHOSU4K",
+		"/stellar/trustline?address=GB2LEGZMXI44AMJNEM5RRWXB7YWUGSKRZJDJPMS2APJVNGMHTOHOSU4K",
+	} {
+		w := do(t, s, http.MethodGet, path, "")
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("%s: Access-Control-Allow-Origin = %q, want *", path, got)
+		}
+	}
+}
+
+// The preflight has to succeed on its own. ServeMux matches on method, so
+// without an explicit OPTIONS route the browser's preflight 405s and the real
+// request is never sent.
+func TestPreflightSucceeds(t *testing.T) {
+	s, _ := testServer(t)
+	w := do(t, s, http.MethodOptions, "/sep10/auth", "")
+	if w.Code != http.StatusNoContent {
+		t.Errorf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Content-Type") {
+		t.Errorf("Allow-Headers = %q, want it to include Content-Type", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
+		t.Errorf("Allow-Methods = %q, want it to include POST", got)
+	}
+}
