@@ -75,7 +75,87 @@ Requires PostgreSQL. `STELLAR_SPONSOR_KEY` must belong to a funded account, and
 For deploying to Koyeb — every environment variable, what to set it to, and how
 to verify the first real payment — see [DEPLOYMENT.md](DEPLOYMENT.md).
 
-## SCF reviewers
+## Reviewing this
 
-[`docs/scf-criteria.md`](docs/scf-criteria.md) maps each tranche acceptance
-criterion to the code that implements it.
+[`docs/scf-criteria.md`](docs/scf-criteria.md) maps each acceptance criterion to
+the code implementing it.
+
+### Check the live service without installing anything
+
+The deployment is public and unauthenticated on these routes. Nothing below
+needs a key, an account, or our cooperation.
+
+```bash
+SERVICE=https://linq-stellar-uselinq-4c0e2a4f.koyeb.app
+
+# 1. Service health
+curl $SERVICE/healthz
+
+# 2. SEP-1 — the info file wallets and anchors read.
+#    Note SIGNING_KEY, WEB_AUTH_ENDPOINT, URI_REQUEST_SIGNING_KEY and ACCOUNTS.
+curl $SERVICE/.well-known/stellar.toml
+
+# 3. SEP-10 — request a real authentication challenge for any Stellar account.
+#    Returns a base64 transaction with sequence number 0, signed by the
+#    SIGNING_KEY published above.
+curl "$SERVICE/sep10/auth?account=GB2LEGZMXI44AMJNEM5RRWXB7YWUGSKRZJDJPMS2APJVNGMHTOHOSU4K"
+
+# 4. Trustline preflight — whether an address can receive USDC at all.
+curl "$SERVICE/stellar/trustline?address=GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+```
+
+Order creation and lookup require an API key, since they mint an on-chain
+account and cost real reserves. Ask us and we will issue one.
+
+### Audit the settlement history on-chain
+
+The `ACCOUNTS` entry in the `stellar.toml` is not decoration. It publishes the
+two accounts this service operates, so the entire settlement history can be
+read from Horizon without asking us for anything:
+
+- **Sponsor** — every deposit account ever provisioned, and the matching merge
+  returning its reserves. Unfunded orders appear here too; nothing is filtered.
+- **Treasury** — every settled payment, with amounts and timestamps.
+
+A settlement is two linked transactions: the payer funds a single-use deposit
+account, then that account pays treasury and is merged away. Cross-referencing
+them shows both the payer and the amount for every order.
+
+### Run the tests
+
+The suite needs no database, no network and no keys.
+
+```bash
+go test ./...          # 35 tests
+go test ./... -race    # the concurrency guarantees below
+```
+
+Worth looking at specifically:
+
+- `TestConcurrentDetectorsCreditOnce` races eight detectors at one order and
+  asserts exactly one wins and the payout is queued exactly once. Deposit
+  detection is deliberately redundant, and this is what makes that safe.
+- `TestSignatureRoundTripsAndDetectsTampering` proves a SEP-7 payment request
+  fails verification if its destination is altered.
+- `TestHorizonOutageFailsClosed` proves SEP-10 refuses to authenticate when it
+  cannot check an account's signers, rather than falling back to weaker
+  verification.
+
+### Run it locally
+
+```bash
+cp .env.example .env   # sponsor key, treasury, database
+docker compose up      # Postgres + server + worker
+```
+
+Or without Docker, against your own Postgres:
+
+```bash
+go run ./cmd/server    # HTTP API on :8080
+go run ./cmd/worker    # settlement loops
+```
+
+The server refuses to start if configuration is missing, and reports every
+missing variable at once rather than one per restart. `STELLAR_SPONSOR_KEY`
+must belong to a funded account and `STELLAR_TREASURY_WALLET` must already hold
+a USDC trustline — the worker warns loudly at startup if it does not.
