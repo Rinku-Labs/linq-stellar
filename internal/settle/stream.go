@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
@@ -37,6 +38,7 @@ type Streamer struct {
 	Interval time.Duration
 	Max      int
 
+	idle   pace.Backoff
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
 }
@@ -54,7 +56,7 @@ func (s *Streamer) Run(ctx context.Context) {
 	defer t.Stop()
 
 	for {
-		s.supervise(ctx)
+		s.idle.Next(s.supervise(ctx), t, interval)
 		select {
 		case <-ctx.Done():
 			s.stopAll()
@@ -74,7 +76,7 @@ func (s *Streamer) max() int {
 
 // supervise starts streams for newly waiting orders and stops those that have
 // moved on.
-func (s *Streamer) supervise(ctx context.Context) {
+func (s *Streamer) supervise(ctx context.Context) (found bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.Log.Error("stream supervisor panicked", "panic", rec)
@@ -89,7 +91,7 @@ func (s *Streamer) supervise(ctx context.Context) {
 		Find(&orders).Error
 	if err != nil {
 		s.Log.Error("stream supervisor query failed", "error", err)
-		return
+		return false
 	}
 
 	wanted := make(map[string]struct{}, len(orders))
@@ -111,6 +113,7 @@ func (s *Streamer) supervise(ctx context.Context) {
 	for i := range orders {
 		s.ensure(ctx, orders[i])
 	}
+	return len(orders) > 0
 }
 
 // ensure starts a stream for an order if one is not already running.

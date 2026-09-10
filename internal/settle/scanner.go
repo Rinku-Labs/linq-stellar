@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 )
@@ -33,6 +34,8 @@ type Scanner struct {
 	Log      *slog.Logger
 	Interval time.Duration
 	Batch    int
+
+	idle pace.Backoff
 }
 
 // Run sweeps until the context is cancelled.
@@ -47,7 +50,7 @@ func (s *Scanner) Run(ctx context.Context) {
 	defer t.Stop()
 
 	for {
-		s.sweep(ctx)
+		s.idle.Next(s.sweep(ctx), t, interval)
 		select {
 		case <-ctx.Done():
 			s.Log.Info("deposit scanner stopped")
@@ -60,7 +63,7 @@ func (s *Scanner) Run(ctx context.Context) {
 // sweep runs one pass. It recovers on its own so one bad cycle — a malformed
 // row, a Horizon shape nothing expected — cannot take the scanner down and
 // leave every waiting order unwatched.
-func (s *Scanner) sweep(ctx context.Context) {
+func (s *Scanner) sweep(ctx context.Context) (found bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			s.Log.Error("deposit sweep panicked", "panic", rec)
@@ -80,15 +83,16 @@ func (s *Scanner) sweep(ctx context.Context) {
 		Find(&orders).Error
 	if err != nil {
 		s.Log.Error("deposit sweep query failed", "error", err)
-		return
+		return false
 	}
 
 	for i := range orders {
 		if ctx.Err() != nil {
-			return
+			return len(orders) > 0
 		}
 		s.check(&orders[i])
 	}
+	return len(orders) > 0
 }
 
 // check does one balance read for a single order.

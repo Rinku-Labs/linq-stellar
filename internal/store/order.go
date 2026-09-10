@@ -119,6 +119,13 @@ type Order struct {
 	// ManualDeposit marks orders where the payer sends an arbitrary amount
 	// rather than an exact quoted one, so the payout reconciles to what landed.
 	ManualDeposit  bool `json:"manualDeposit"`
+	// ReservesReclaimed marks an expired order as finished with, whether its
+	// deposit account was closed or there was nothing left to close. Without it
+	// expired orders stay in the reclaim query permanently: the state is
+	// terminal, so they are re-selected and re-checked against Horizon on every
+	// pass, forever, and the set only grows.
+	ReservesReclaimed bool `gorm:"default:false;index" json:"reservesReclaimed"`
+
 	PayoutAttempts int  `gorm:"default:0" json:"payoutAttempts"`
 	SweepAttempts  int  `gorm:"default:0" json:"sweepAttempts"`
 	RefundAttempts int  `gorm:"default:0" json:"refundAttempts"`

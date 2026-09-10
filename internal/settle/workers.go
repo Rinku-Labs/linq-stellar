@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
@@ -30,6 +31,8 @@ type ChainWorker struct {
 	Log      *slog.Logger
 	Interval time.Duration
 	Batch    int
+
+	idle pace.Backoff
 }
 
 // Run works the chain queues until the context is cancelled.
@@ -44,9 +47,17 @@ func (w *ChainWorker) Run(ctx context.Context) {
 	defer t.Stop()
 
 	for {
-		w.each(ctx, store.StateSweepQueued, w.sweep)
-		w.each(ctx, store.StateRefundQueued, w.refund)
-		w.each(ctx, store.StateExpired, w.reclaim)
+		worked := w.each(ctx, store.StateSweepQueued, nil, w.sweep)
+		worked = w.each(ctx, store.StateRefundQueued, nil, w.refund) || worked
+		// Expired is a terminal state, so this query would never drain without
+		// the reserves_reclaimed filter — every expired order would be
+		// re-selected on every pass for the life of the service.
+		worked = w.each(ctx, store.StateExpired, func(q *gorm.DB) *gorm.DB {
+			return q.Where("reserves_reclaimed = ?", false)
+		}, w.reclaim) || worked
+
+		w.idle.Next(worked, t, interval)
+
 		select {
 		case <-ctx.Done():
 			w.Log.Info("chain worker stopped")
@@ -56,8 +67,9 @@ func (w *ChainWorker) Run(ctx context.Context) {
 	}
 }
 
-// each runs fn over a batch of orders in one state.
-func (w *ChainWorker) each(ctx context.Context, status string, fn func(*store.Order)) {
+// each runs fn over a batch of orders in one state, and reports whether it
+// found any. narrow may add further conditions to the query.
+func (w *ChainWorker) each(ctx context.Context, status string, narrow func(*gorm.DB) *gorm.DB, fn func(*store.Order)) (found bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			w.Log.Error("chain worker panicked", "status", status, "panic", rec)
@@ -69,21 +81,26 @@ func (w *ChainWorker) each(ctx context.Context, status string, fn func(*store.Or
 		batch = defaultChainBatch
 	}
 
+	q := w.DB.Where("status = ?", status)
+	if narrow != nil {
+		q = narrow(q)
+	}
+
 	var orders []store.Order
-	if err := w.DB.
-		Where("status = ?", status).
+	if err := q.
 		Order("updated_at ASC").
 		Limit(batch).
 		Find(&orders).Error; err != nil {
 		w.Log.Error("chain worker query failed", "status", status, "error", err)
-		return
+		return false
 	}
 	for i := range orders {
 		if ctx.Err() != nil {
-			return
+			return len(orders) > 0
 		}
 		fn(&orders[i])
 	}
+	return len(orders) > 0
 }
 
 // sweep moves a disbursed order's USDC to treasury and closes its account.
@@ -175,25 +192,48 @@ func (w *ChainWorker) refund(order *store.Order) {
 // depends on to provision anything at all.
 func (w *ChainWorker) reclaim(order *store.Order) {
 	if order.SweepTxHash != "" || order.RefundTxHash != "" {
-		return // already closed
+		// Already closed by a sweep or refund; just stop looking at it.
+		w.markReclaimed(order, nil)
+		return
 	}
 
 	hash, err := w.Chain.Reclaim(order.EncryptedSeed)
 	if err != nil {
+		// Leave it unmarked so the next pass retries — a Horizon failure is not
+		// evidence there is nothing to reclaim.
 		w.Log.Warn("could not reclaim deposit account", "order", order.ID, "error", err)
 		return
 	}
-	if hash == "" {
-		return // nothing left to close
-	}
 
+	// An empty hash means there was nothing left to close, which is a finished
+	// outcome rather than a reason to look again. Marking it is what stops this
+	// order being re-checked against Horizon on every pass for the life of the
+	// service.
+	fields := map[string]any{}
+	if hash != "" {
+		fields["sweep_tx_hash"] = hash
+	}
+	w.markReclaimed(order, fields)
+
+	if hash != "" {
+		w.Log.Info("reclaimed sponsor reserves", "order", order.ID, "tx", hash)
+	}
+}
+
+// markReclaimed takes an expired order out of the reclaim queue for good.
+func (w *ChainWorker) markReclaimed(order *store.Order, extra map[string]any) {
+	fields := map[string]any{
+		"reserves_reclaimed": true,
+		"updated_at":         time.Now().UTC(),
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
 	if err := w.DB.Model(&store.Order{}).
 		Where("id = ?", order.ID).
-		Updates(map[string]any{"sweep_tx_hash": hash, "updated_at": time.Now().UTC()}).Error; err != nil {
-		w.Log.Error("reclaimed but could not record it", "order", order.ID, "tx", hash, "error", err)
-		return
+		Updates(fields).Error; err != nil {
+		w.Log.Error("could not mark order reclaimed", "order", order.ID, "error", err)
 	}
-	w.Log.Info("reclaimed sponsor reserves", "order", order.ID, "tx", hash)
 }
 
 // retry backs an order out for another attempt, or gives up and flags it.

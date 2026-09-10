@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 )
@@ -35,6 +36,8 @@ type Worker struct {
 	Log      *slog.Logger
 	Interval time.Duration
 	Batch    int
+
+	idle pace.Backoff
 }
 
 // Run processes payouts until the context is cancelled.
@@ -49,7 +52,7 @@ func (w *Worker) Run(ctx context.Context) {
 	defer t.Stop()
 
 	for {
-		w.sweep(ctx)
+		w.idle.Next(w.sweep(ctx), t, interval)
 		select {
 		case <-ctx.Done():
 			w.Log.Info("payout worker stopped")
@@ -59,7 +62,7 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-func (w *Worker) sweep(ctx context.Context) {
+func (w *Worker) sweep(ctx context.Context) (found bool) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			w.Log.Error("payout sweep panicked", "panic", rec)
@@ -78,15 +81,16 @@ func (w *Worker) sweep(ctx context.Context) {
 		Limit(batch).
 		Find(&orders).Error; err != nil {
 		w.Log.Error("payout sweep query failed", "error", err)
-		return
+		return false
 	}
 
 	for i := range orders {
 		if ctx.Err() != nil {
-			return
+			return len(orders) > 0
 		}
 		w.pay(&orders[i])
 	}
+	return len(orders) > 0
 }
 
 // pay disburses one order.
