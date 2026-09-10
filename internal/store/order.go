@@ -43,9 +43,32 @@ type Order struct {
 	// AmountUSDC is what actually arrived on-chain, not what was requested.
 	// Deposits are manual — a payer sends what they like — so recording the
 	// requested figure here would make the order permanently misreport itself.
+	// Before a deposit lands it holds QuotedUSDC, so the payment URI has an
+	// amount to prefill.
 	AmountUSDC float64 `json:"amountUsdc"`
 	AmountNGN  float64 `json:"amountNgn"`
 	Rate       float64 `gorm:"type:double precision" json:"rate"`
+
+	// QuotedUSDC and QuotedNGN are the deal struck at creation: what the payer
+	// was asked to send, and what the merchant was promised for it. Unlike
+	// AmountUSDC they are never rewritten, which is what makes it possible to
+	// ask afterwards whether a deposit actually settled the invoice — the
+	// question nobody could answer while the quote was being overwritten by the
+	// deposit that was supposed to satisfy it.
+	//
+	// Zero means an open-amount order, where the payer picked the figure and
+	// there is no invoice to honour. Orders created before these columns
+	// existed read as zero and therefore keep their original behaviour.
+	QuotedUSDC float64 `json:"quotedUsdc"`
+	QuotedNGN  float64 `json:"quotedNgn"`
+	// Underpaid marks an order whose deposit did not cover its quote. The
+	// payout still goes out for what arrived — the merchant is owed the value
+	// of a real payment — but the shortfall is recorded rather than absorbed
+	// silently into a smaller number.
+	Underpaid bool `gorm:"default:false" json:"underpaid"`
+	// ShortfallNGN is how far the payout fell below QuotedNGN. Zero unless
+	// Underpaid.
+	ShortfallNGN float64 `gorm:"default:0" json:"shortfallNgn"`
 	// FeeUSDC is always zero on Stellar. It is stored explicitly rather than
 	// omitted so the zero-fee claim is auditable per order instead of being
 	// inferred from a missing column.

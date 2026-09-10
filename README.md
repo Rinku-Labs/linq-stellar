@@ -121,12 +121,35 @@ A settlement is two linked transactions: the payer funds a single-use deposit
 account, then that account pays treasury and is merged away. Cross-referencing
 them shows both the payer and the amount for every order.
 
+### How an amount is quoted
+
+A naira invoice rarely converts to a round USDC figure: ₦100 at ₦1,364.21 per
+USDC is 0.0733018… USDC. Shortening that is unavoidable, and the direction it
+is shortened in is a decision about whose money absorbs the difference.
+
+Two rules settle it, both in `internal/money`:
+
+1. **A quote rounds up**, to six decimals — one tighter than Stellar's seven,
+   so the same figure is exact on screen, in the SEP-7 URI, and in wallets that
+   carry six decimals for USDC on other chains. The payer is asked for at most
+   a ten-thousandth of a cent more than the invoice, never less.
+2. **A covered deposit pays the quote.** Once the payment reaches the quoted
+   amount, the merchant is paid the naira they were promised, not a figure
+   recomputed from the deposit. Recomputing is how a rounding loss in the quote
+   becomes a shortfall in the payout.
+
+A deposit that does not cover the quote is paid out at what it is actually
+worth and marked `underpaid`, with the gap in `shortfallNgn`. Nothing is
+silently absorbed in either direction: an order says what it asked for
+(`quotedUsdc`, `quotedNgn`), what arrived (`amountUsdc`), and what was paid
+(`amountNgn`).
+
 ### Run the tests
 
 The suite needs no database, no network and no keys.
 
 ```bash
-go test ./...          # 35 tests
+go test ./...          # 52 tests
 go test ./... -race    # the concurrency guarantees below
 ```
 
@@ -135,6 +158,10 @@ Worth looking at specifically:
 - `TestConcurrentDetectorsCreditOnce` races eight detectors at one order and
   asserts exactly one wins and the payout is queued exactly once. Deposit
   detection is deliberately redundant, and this is what makes that safe.
+- `TestQuotingAndSettlingRoundTripsExactly` quotes a spread of invoices at a
+  spread of rates, settles each with a payment of exactly the quoted amount,
+  and asserts the merchant receives the invoice to the kobo. See
+  "How an amount is quoted" below for why that needs proving.
 - `TestSignatureRoundTripsAndDetectsTampering` proves a SEP-7 payment request
   fails verification if its destination is altered.
 - `TestHorizonOutageFailsClosed` proves SEP-10 refuses to authenticate when it

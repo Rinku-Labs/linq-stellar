@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
-	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/glebarez/sqlite"
+	"github.com/stellar/go-stellar-sdk/keypair"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -258,6 +258,75 @@ func TestOrderResponseCarriesSEP7URI(t *testing.T) {
 	}
 	if body["feeUsdc"] != float64(0) {
 		t.Errorf("feeUsdc = %v, want 0", body["feeUsdc"])
+	}
+}
+
+// A payment URI must carry the amount the invoice actually needs, to the
+// decimal. Truncating it — a two-decimal 0.07 against a ₦100 invoice — is what
+// had payers sending 4.5% less than they owed and merchants absorbing it.
+func TestPaymentURICarriesTheExactQuote(t *testing.T) {
+	s, db := testServer(t)
+	db.Create(&store.Order{
+		ID:             "order-quote",
+		IdempotencyKey: "key-quote",
+		Status:         store.StateAwaitingDeposit,
+		DepositAddress: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+		AmountUSDC:     0.073303,
+		AmountNGN:      100,
+		QuotedUSDC:     0.073303,
+		QuotedNGN:      100,
+		Rate:           1364.21,
+	})
+
+	w := do(t, s, http.MethodGet, "/orders/order-quote", "")
+	var body map[string]any
+	json.Unmarshal(w.Body.Bytes(), &body)
+
+	uri, _ := body["paymentUri"].(string)
+	if !strings.Contains(uri, "amount=0.073303") {
+		t.Errorf("paymentUri does not ask for the full quote: %s", uri)
+	}
+
+	// The quote is published in its own right, so a caller can show a payer
+	// what is still owed after a short deposit rewrites amountUsdc.
+	if body["quotedUsdc"] != 0.073303 {
+		t.Errorf("quotedUsdc = %v, want 0.073303", body["quotedUsdc"])
+	}
+	if body["quotedNgn"] != float64(100) {
+		t.Errorf("quotedNgn = %v, want 100", body["quotedNgn"])
+	}
+	if _, flagged := body["underpaid"]; flagged {
+		t.Error("an order with no deposit was reported as underpaid")
+	}
+}
+
+// A short deposit has to be visible in the payload, not just in the naira
+// figure it silently reduced.
+func TestUnderpaidOrderReportsItsShortfall(t *testing.T) {
+	s, db := testServer(t)
+	db.Create(&store.Order{
+		ID:             "order-short",
+		IdempotencyKey: "key-short",
+		Status:         store.StatePayoutQueued,
+		DepositAddress: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+		AmountUSDC:     0.07,
+		AmountNGN:      95.49,
+		QuotedUSDC:     0.073303,
+		QuotedNGN:      100,
+		Rate:           1364.21,
+		Underpaid:      true,
+		ShortfallNGN:   4.51,
+	})
+
+	w := do(t, s, http.MethodGet, "/orders/order-short", "")
+	var body map[string]any
+	json.Unmarshal(w.Body.Bytes(), &body)
+
+	if body["underpaid"] != true {
+		t.Errorf("underpaid = %v, want true", body["underpaid"])
+	}
+	if body["shortfallNgn"] != 4.51 {
+		t.Errorf("shortfallNgn = %v, want 4.51", body["shortfallNgn"])
 	}
 }
 

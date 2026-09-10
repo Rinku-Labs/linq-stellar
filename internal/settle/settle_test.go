@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/glebarez/sqlite"
+	"github.com/Rinku-Labs/linq-stellar/internal/money"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -146,26 +147,150 @@ func TestFailedEnqueueReleasesTheClaim(t *testing.T) {
 	}
 }
 
-// A precomputed order keeps the NGN it was quoted; a manual one reconciles to
-// what actually arrived.
+// A deposit that covers the quote pays the quote, manual or not. A manual
+// order pays more for an overpayment; neither pays less than what was promised.
 func TestManualDepositReconcilesNGN(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		manual  bool
-		wantNGN float64
+		name     string
+		manual   bool
+		received float64
+		wantNGN  float64
 	}{
-		{"manual reconciles", true, 50 * 1655},
-		{"precomputed keeps quote", false, 82750},
+		{"manual pays for an overpayment", true, 60, 60 * 1655},
+		{"precomputed caps at the quote", false, 60, 82750},
+		{"manual honours the quote when covered", true, 50, 82750},
+		{"precomputed honours the quote", false, 50, 82750},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := testDB(t)
 			o := waitingOrder(t, db)
 			o.ManualDeposit = tc.manual
-			o.AmountNGN = 82750
+			o.AmountNGN, o.QuotedNGN, o.QuotedUSDC = 82750, 82750, 50
 			db.Save(o)
 
 			d := newDeposits(db, &countingPayouts{})
-			if _, err := d.Record(o, 50, stellar.DepositInfo{}); err != nil {
+			if _, err := d.Record(o, tc.received, stellar.DepositInfo{}); err != nil {
+				t.Fatalf("record: %v", err)
+			}
+
+			var after store.Order
+			db.First(&after, "id = ?", o.ID)
+			if after.AmountNGN != tc.wantNGN {
+				t.Errorf("amountNgn = %v, want %v", after.AmountNGN, tc.wantNGN)
+			}
+			if after.Underpaid {
+				t.Error("a covered deposit was recorded as underpaid")
+			}
+		})
+	}
+}
+
+// The incident, end to end: a ₦100 order quoted at 0.073303 USDC must pay the
+// merchant ₦100, not the ₦95.49 that recomputing from a rounded-down deposit
+// produced.
+func TestCoveredDepositPaysTheInvoice(t *testing.T) {
+	db := testDB(t)
+	o := waitingOrder(t, db)
+	o.Rate = 1364.21
+	o.ManualDeposit = true
+	o.AmountNGN, o.QuotedNGN, o.QuotedUSDC = 100, 100, 0.073303
+	db.Save(o)
+
+	d := newDeposits(db, &countingPayouts{})
+	if _, err := d.Record(o, 0.073303, stellar.DepositInfo{}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	var after store.Order
+	db.First(&after, "id = ?", o.ID)
+	if after.AmountNGN != 100 {
+		t.Errorf("amountNgn = %v, want the invoiced 100", after.AmountNGN)
+	}
+}
+
+// An underpayment still pays out — the money is real — but it is recorded as
+// one rather than quietly becoming a smaller payout.
+func TestUnderpaymentIsPaidAndFlagged(t *testing.T) {
+	db := testDB(t)
+	o := waitingOrder(t, db)
+	o.Rate = 1364.21
+	o.ManualDeposit = true
+	o.AmountNGN, o.QuotedNGN, o.QuotedUSDC = 100, 100, 0.073303
+	db.Save(o)
+
+	d := newDeposits(db, &countingPayouts{})
+	// What the old two-decimal quote asked a payer for.
+	if _, err := d.Record(o, 0.07, stellar.DepositInfo{}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	var after store.Order
+	db.First(&after, "id = ?", o.ID)
+	if !after.Underpaid {
+		t.Error("a deposit 4.5% below the quote was not flagged as underpaid")
+	}
+	if want := 95.49; after.AmountNGN != want {
+		t.Errorf("amountNgn = %v, want %v (the value of what arrived)", after.AmountNGN, want)
+	}
+	if want := 4.51; after.ShortfallNGN != want {
+		t.Errorf("shortfallNgn = %v, want %v", after.ShortfallNGN, want)
+	}
+}
+
+// Orders created before the quote columns existed read as zero and must keep
+// behaving exactly as they did: paid for whatever arrived.
+func TestOrderWithoutAQuotePaysForWhatArrived(t *testing.T) {
+	db := testDB(t)
+	o := waitingOrder(t, db)
+	o.ManualDeposit = true
+	db.Save(o)
+
+	d := newDeposits(db, &countingPayouts{})
+	if _, err := d.Record(o, 50, stellar.DepositInfo{}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+
+	var after store.Order
+	db.First(&after, "id = ?", o.ID)
+	if want := 50 * 1655.0; after.AmountNGN != want {
+		t.Errorf("amountNgn = %v, want %v", after.AmountNGN, want)
+	}
+	if after.Underpaid {
+		t.Error("an open-amount order was flagged as underpaid")
+	}
+}
+
+// An order already in flight when the quote columns shipped carries its quote
+// in AmountUSDC/AmountNGN, and must settle by the same rule as a new one.
+//
+// The underpaid case is a deliberate change of behaviour. A fixed-amount order
+// used to keep its quoted NGN whatever arrived, so a payer who sent a tenth of
+// the invoice still had the merchant credited in full and Linq absorbed the
+// rest — free money for anyone who noticed. Now a short deposit pays what it
+// is worth and is flagged, on fixed and manual orders alike.
+func TestInFlightOrderUsesItsPreQuoteColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		manual   bool
+		received float64
+		wantNGN  float64
+	}{
+		{"fixed order covered in full is paid the quote", false, 0.073303, 100},
+		{"fixed order underpaid is paid what arrived", false, 0.07, 95.49},
+		{"manual order is paid the invoice once covered", true, 0.073303, 100},
+		{"manual order underpaid is paid what arrived", true, 0.07, 95.49},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testDB(t)
+			o := waitingOrder(t, db)
+			o.Rate = 1364.21
+			o.ManualDeposit = tc.manual
+			// No QuotedUSDC/QuotedNGN, exactly as an existing row reads.
+			o.AmountUSDC, o.AmountNGN = 0.073303, 100
+			db.Save(o)
+
+			d := newDeposits(db, &countingPayouts{})
+			if _, err := d.Record(o, tc.received, stellar.DepositInfo{}); err != nil {
 				t.Fatalf("record: %v", err)
 			}
 
@@ -180,21 +305,56 @@ func TestManualDepositReconcilesNGN(t *testing.T) {
 
 func TestReconcile(t *testing.T) {
 	cases := []struct {
-		name               string
-		balance, fee, rate float64
-		wantPayable        float64
-		wantErr            bool
+		name        string
+		in          Deposit
+		wantPayable float64
+		wantNGN     float64
+		wantUnder   bool
+		wantErr     bool
 	}{
-		{"zero fee pays the full deposit", 50, 0, 1655, 50, false},
-		{"fee comes off the top", 50, 1, 1655, 49, false},
-		{"nothing arrived", 0, 0, 1655, 0, true},
-		{"negative balance", -1, 0, 1655, 0, true},
-		{"deposit equals the fee", 1, 1, 1655, 0, true},
-		{"deposit below the fee", 0.5, 1, 1655, 0, true},
+		{
+			name:        "zero fee pays the full deposit",
+			in:          Deposit{Received: 50, Rate: 1655},
+			wantPayable: 50, wantNGN: 82750,
+		},
+		{
+			name:        "fee comes off the top",
+			in:          Deposit{Received: 50, Fee: 1, Rate: 1655},
+			wantPayable: 49, wantNGN: 81095,
+		},
+		{
+			name:        "a covered quote is paid in full",
+			in:          Deposit{Received: 0.073303, Rate: 1364.21, QuotedUSDC: 0.073303, QuotedNGN: 100},
+			wantPayable: 0.073303, wantNGN: 100,
+		},
+		{
+			name:        "a quote covered to the dust unit is still covered",
+			in:          Deposit{Received: 0.073302, Rate: 1364.21, QuotedUSDC: 0.073303, QuotedNGN: 100},
+			wantPayable: 0.073302, wantNGN: 100,
+		},
+		{
+			name:        "the two-decimal underpayment",
+			in:          Deposit{Received: 0.07, Rate: 1364.21, QuotedUSDC: 0.073303, QuotedNGN: 100},
+			wantPayable: 0.07, wantNGN: 95.49, wantUnder: true,
+		},
+		{
+			name:        "an overpayment on a manual order pays for what arrived",
+			in:          Deposit{Received: 1, Rate: 1364.21, QuotedUSDC: 0.073303, QuotedNGN: 100, Manual: true},
+			wantPayable: 1, wantNGN: 1364.21,
+		},
+		{
+			name:        "an overpayment on a fixed order pays the quote",
+			in:          Deposit{Received: 1, Rate: 1364.21, QuotedUSDC: 0.073303, QuotedNGN: 100},
+			wantPayable: 1, wantNGN: 100,
+		},
+		{name: "nothing arrived", in: Deposit{Rate: 1655}, wantErr: true},
+		{name: "negative balance", in: Deposit{Received: -1, Rate: 1655}, wantErr: true},
+		{name: "deposit equals the fee", in: Deposit{Received: 1, Fee: 1, Rate: 1655}, wantErr: true},
+		{name: "deposit below the fee", in: Deposit{Received: 0.5, Fee: 1, Rate: 1655}, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			payable, ngn, err := Reconcile(tc.balance, tc.fee, tc.rate)
+			got, err := Reconcile(tc.in)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected an error, got none")
@@ -204,13 +364,50 @@ func TestReconcile(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if payable != tc.wantPayable {
-				t.Errorf("payable = %v, want %v", payable, tc.wantPayable)
+			if got.PayableUSDC != tc.wantPayable {
+				t.Errorf("payable = %v, want %v", got.PayableUSDC, tc.wantPayable)
 			}
-			if want := tc.wantPayable * tc.rate; ngn != want {
-				t.Errorf("ngn = %v, want %v", ngn, want)
+			if got.PayoutNGN != tc.wantNGN {
+				t.Errorf("payoutNgn = %v, want %v", got.PayoutNGN, tc.wantNGN)
+			}
+			if got.Underpaid != tc.wantUnder {
+				t.Errorf("underpaid = %v, want %v", got.Underpaid, tc.wantUnder)
 			}
 		})
+	}
+}
+
+// The invariant the whole change exists to hold, checked across a spread of
+// invoices and rates rather than at the one figure from the incident: quote an
+// invoice, pay exactly that quote, and the merchant receives exactly the
+// invoice.
+func TestQuotingAndSettlingRoundTripsExactly(t *testing.T) {
+	rates := []float64{1364.21, 1362.55, 1655, 1000, 1499.999, 923.4567}
+	invoices := []float64{1, 50, 100, 150, 999.99, 25_000, 1_000_000}
+
+	for _, rate := range rates {
+		for _, invoice := range invoices {
+			quoted, err := money.QuoteUSDC(invoice, rate)
+			if err != nil {
+				t.Fatalf("QuoteUSDC(%v, %v): %v", invoice, rate, err)
+			}
+			got, err := Reconcile(Deposit{
+				Received: quoted, Rate: rate,
+				QuotedUSDC: quoted, QuotedNGN: money.RoundNGN(invoice),
+				Manual: true,
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if got.Underpaid {
+				t.Errorf("paying the exact quote for ₦%v at %v was read as an underpayment",
+					invoice, rate)
+			}
+			if want := money.RoundNGN(invoice); got.PayoutNGN < want {
+				t.Errorf("₦%v invoice at %v paid out %v, short of the invoice",
+					invoice, rate, got.PayoutNGN)
+			}
+		}
 	}
 }
 

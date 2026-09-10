@@ -11,10 +11,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/Rinku-Labs/linq-stellar/internal/money"
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -242,6 +243,36 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// The quote, struck before anything is provisioned. Whichever side the
+	// caller supplied, the other is derived here and both are then fixed for
+	// the life of the order.
+	//
+	// The USDC side rounds UP (money.QuoteUSDC) rather than to nearest. That
+	// direction is the difference between asking a payer for 0.073303 USDC
+	// against a ₦100 invoice and asking for 0.07 — the second is 4.5% short,
+	// and it was the merchant who absorbed the difference.
+	//
+	// Quoting first also means a quote that cannot be struck costs nothing: an
+	// unquotable order used to reach this point only after the sponsor had
+	// already paid the reserves for an account nobody would ever fund.
+	amountUSDC, amountNGN := req.AmountUSDC, req.AmountNGN
+	if amountUSDC == 0 {
+		amountUSDC, err = money.QuoteUSDC(amountNGN, req.Rate)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		// A caller who names the USDC still gets it snapped to a precision the
+		// network and the payer's wallet can both express exactly.
+		amountUSDC = money.CeilUSDC(amountUSDC)
+	}
+	if amountNGN == 0 {
+		amountNGN = money.QuoteNGN(amountUSDC, req.Rate)
+	} else {
+		amountNGN = money.RoundNGN(amountNGN)
+	}
+
 	address, encryptedSeed, err := s.Chain.GenerateAccount()
 	if err != nil {
 		s.Log.Error("could not generate deposit account", "error", err)
@@ -260,14 +291,6 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	amountUSDC, amountNGN := req.AmountUSDC, req.AmountNGN
-	if amountUSDC == 0 && req.Rate > 0 {
-		amountUSDC = amountNGN / req.Rate
-	}
-	if amountNGN == 0 {
-		amountNGN = amountUSDC * req.Rate
-	}
-
 	order := store.Order{
 		ID:              uuid.NewString(),
 		BusinessID:      req.BusinessID,
@@ -276,6 +299,8 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		Status:          store.StateAwaitingDeposit,
 		AmountUSDC:      amountUSDC,
 		AmountNGN:       amountNGN,
+		QuotedUSDC:      amountUSDC,
+		QuotedNGN:       amountNGN,
 		Rate:            req.Rate,
 		FeeUSDC:         0, // Stellar is the zero-fee rail; stored, not implied
 		DepositAddress:  address,
@@ -320,11 +345,17 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 // place a wrong asset issuer could creep in.
 func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	payload := map[string]any{
-		"id":              o.ID,
-		"status":          o.Status,
-		"depositAddress":  o.DepositAddress,
-		"amountUsdc":      o.AmountUSDC,
-		"amountNgn":       o.AmountNGN,
+		"id":             o.ID,
+		"status":         o.Status,
+		"depositAddress": o.DepositAddress,
+		"amountUsdc":     o.AmountUSDC,
+		"amountNgn":      o.AmountNGN,
+		// The quote is published alongside the running amounts, not folded into
+		// them. Before a deposit the two agree; after one, amountUsdc is what
+		// arrived and quotedUsdc is what was asked for, and a caller that wants
+		// to show a payer "you sent 0.07 of the 0.073303 due" needs both.
+		"quotedUsdc":      o.QuotedUSDC,
+		"quotedNgn":       o.QuotedNGN,
 		"rate":            o.Rate,
 		"feeUsdc":         o.FeeUSDC,
 		"currency":        o.Currency,
@@ -339,6 +370,12 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	}
 	if o.SweepTxHash != "" {
 		payload["sweepTxHash"] = o.SweepTxHash
+	}
+	// Only present when it happened, so a caller cannot mistake the ordinary
+	// false for "we checked and it was fine" on an order predating the check.
+	if o.Underpaid {
+		payload["underpaid"] = true
+		payload["shortfallNgn"] = o.ShortfallNGN
 	}
 
 	if o.DepositAddress != "" && !store.IsTerminal(o.Status) {
