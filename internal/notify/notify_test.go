@@ -307,3 +307,88 @@ func TestDisabledWithoutURL(t *testing.T) {
 		t.Fatal("Run did not return with no URL configured")
 	}
 }
+
+// The receiver writes the emails, and it can only say what this payload tells
+// it. A refund notice that does not name the destination, or a payout failure
+// that does not carry the provider's reason, turns into a support ticket asking
+// the question the event already had the answer to.
+func TestRefundEventCarriesWhatTheEmailNeeds(t *testing.T) {
+	r := newReceiver(t)
+	w := newWorker(t, r.URL, "")
+
+	order := store.Order{
+		ID:             "ord_refund_detail",
+		IdempotencyKey: "idem_ord_refund_detail",
+		Status:         store.StatePayoutProcessing,
+		AmountNGN:      9940,
+		AmountUSDC:     6.1,
+		QuotedNGN:      10000,
+		QuotedUSDC:     6.135,
+		DepositAddress: "GDEPOSIT",
+		DepositFrom:    "GPAYER",
+		DepositTxHash:  "deposit-tx",
+	}
+	if err := w.DB.Create(&order).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := store.ClaimStatusBecause(w.DB, order.ID,
+		store.StatePayoutProcessing, store.StateRefundQueued,
+		"bank declined: account name mismatch"); err != nil {
+		t.Fatalf("queue refund: %v", err)
+	}
+
+	w.sweep(context.Background())
+
+	var e Event
+	if err := json.Unmarshal(<-r.bodies, &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Status != store.StateRefundQueued {
+		t.Fatalf("status = %q, want %q", e.Status, store.StateRefundQueued)
+	}
+	if e.Reason != "bank declined: account name mismatch" {
+		t.Errorf("reason = %q; the merchant is owed the provider's own words", e.Reason)
+	}
+	if e.RefundDestination != "GPAYER" {
+		t.Errorf("refundDestination = %q, want the payer's own account", e.RefundDestination)
+	}
+	if e.QuotedNGN != 10000 {
+		t.Errorf("quotedNgn = %v, want the invoice the order was struck at", e.QuotedNGN)
+	}
+	if e.DepositAddress != "GDEPOSIT" {
+		t.Errorf("depositAddress = %q, want the account the payer paid into", e.DepositAddress)
+	}
+}
+
+// A payer who named a refund address gets their refund there, so that is the
+// destination the notice has to quote — not the account they happened to send
+// from.
+func TestRefundDestinationPrefersTheAddressThePayerGave(t *testing.T) {
+	r := newReceiver(t)
+	w := newWorker(t, r.URL, "")
+
+	order := store.Order{
+		ID:             "ord_refund_named",
+		IdempotencyKey: "idem_ord_refund_named",
+		Status:         store.StatePayoutProcessing,
+		RefundAddress:  "GNAMED",
+		DepositFrom:    "GPAYER",
+	}
+	if err := w.DB.Create(&order).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := store.ClaimStatus(w.DB, order.ID,
+		store.StatePayoutProcessing, store.StateRefundQueued); err != nil {
+		t.Fatalf("queue refund: %v", err)
+	}
+
+	w.sweep(context.Background())
+
+	var e Event
+	if err := json.Unmarshal(<-r.bodies, &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.RefundDestination != "GNAMED" {
+		t.Errorf("refundDestination = %q, want the address the payer supplied", e.RefundDestination)
+	}
+}

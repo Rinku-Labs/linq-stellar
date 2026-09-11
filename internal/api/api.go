@@ -16,6 +16,7 @@ import (
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -44,6 +45,10 @@ type Server struct {
 	// listen — never zero-value in a running server.
 	OrdersAPIKey string
 	Log          *slog.Logger
+	// Wake tells the worker deployment there is something to do — a new order
+	// to watch, a pooled account to replace. Optional: without it the worker
+	// still finds both on its next pass.
+	Wake *wake.Bus
 }
 
 // requireAPIKey wraps a handler with the shared-secret check for order routes.
@@ -289,26 +294,18 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		amountNGN = money.RoundNGN(amountNGN)
 	}
 
-	address, encryptedSeed, err := s.Chain.GenerateAccount()
-	if err != nil {
-		s.Log.Error("could not generate deposit account", "error", err)
-		writeError(w, http.StatusInternalServerError, "could not create a deposit address")
-		return
-	}
+	orderID := uuid.NewString()
 
-	// Provision before the address is ever shown. An unprovisioned address
-	// rejects USDC, so publishing one would take the payer's payment and bounce
-	// it.
-	provisionTx, err := s.Chain.Provision(encryptedSeed)
+	deposit, err := s.depositAccount(orderID)
 	if err != nil {
-		s.Log.Error("could not provision deposit account", "address", address, "error", err)
+		s.Log.Error("could not prepare a deposit account", "order", orderID, "error", err)
 		writeError(w, http.StatusServiceUnavailable,
 			"could not prepare a deposit address right now; try again shortly")
 		return
 	}
 
 	order := store.Order{
-		ID:              uuid.NewString(),
+		ID:              orderID,
 		BusinessID:      req.BusinessID,
 		IdempotencyKey:  req.IdempotencyKey,
 		CustomerRef:     req.CustomerRef,
@@ -319,9 +316,9 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		QuotedNGN:       amountNGN,
 		Rate:            req.Rate,
 		FeeUSDC:         0, // Stellar is the zero-fee rail; stored, not implied
-		DepositAddress:  address,
-		EncryptedSeed:   encryptedSeed,
-		ProvisionTxHash: provisionTx,
+		DepositAddress:  deposit.Address,
+		EncryptedSeed:   deposit.EncryptedSeed,
+		ProvisionTxHash: deposit.ProvisionTxHash,
 		RefundAddress:   req.RefundAddress,
 		BankCode:        req.BankCode,
 		BankAccount:     req.BankAccount,
@@ -333,15 +330,113 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.DB.Create(&order).Error; err != nil {
-		// The account exists on-chain but no order references it. Log the seed
-		// reference so the reserves can be reclaimed rather than lost.
+		// The account exists on-chain but no order references it. A pooled one
+		// goes back on the shelf; an inline one is only recoverable from the
+		// log, so its seed reference is written there.
+		if deposit.PoolID != 0 {
+			if relErr := store.ReleasePoolAccount(s.DB, deposit.PoolID); relErr != nil {
+				s.Log.Error("could not return a claimed deposit account to the pool",
+					"account", deposit.Address, "error", relErr)
+			}
+		}
 		s.Log.Error("provisioned an account but could not save the order",
-			"address", address, "provisionTx", provisionTx, "error", err)
+			"address", deposit.Address, "provisionTx", deposit.ProvisionTxHash, "error", err)
 		writeError(w, http.StatusInternalServerError, "could not create the order")
 		return
 	}
 
+	s.Log.Info("stellar order created",
+		"order", order.ID,
+		"account", deposit.Address,
+		"source", deposit.Source,
+		"amountUsdc", order.QuotedUSDC,
+		"amountNgn", order.QuotedNGN,
+		"rate", order.Rate,
+		"deadline", order.DepositDeadline.Format(time.RFC3339))
+
+	// Tell the worker there is an account to watch. Without this the order
+	// waits for the deposit streamer's next unprompted pass, which on a quiet
+	// service is up to two minutes — all of it while the payer is already
+	// looking at the address and may already have sent to it.
+	s.Wake.Signal(wake.Deposits)
+
 	s.writeOrder(w, http.StatusCreated, &order)
+}
+
+// depositAccount is where an order's Stellar address comes from.
+//
+// The pool holds accounts that are already on-chain with a USDC trustline, so
+// the usual path is a single claimed row and no Horizon call at all — order
+// creation went from around eight seconds to a database round-trip.
+//
+// An empty pool provisions inline, exactly as this did before the pool existed.
+// That is the whole reason the pool is allowed to be a buffer rather than a
+// dependency: a payer waits, which is bad, instead of being turned away, which
+// is worse.
+func (s *Server) depositAccount(orderID string) (depositAccount, error) {
+	started := time.Now()
+
+	claimed, err := store.ClaimPoolAccount(s.DB, orderID)
+	switch {
+	case err == nil:
+		s.Wake.Signal(wake.Pool) // one fewer ready; ask for a replacement now
+		s.Log.Info("claimed a pooled deposit account",
+			"order", orderID, "account", claimed.Address,
+			"elapsed_ms", time.Since(started).Milliseconds())
+		return depositAccount{
+			Address:         claimed.Address,
+			EncryptedSeed:   claimed.EncryptedSeed,
+			ProvisionTxHash: claimed.ProvisionTxHash,
+			PoolID:          claimed.ID,
+			Source:          "pool",
+		}, nil
+	case !errors.Is(err, store.ErrPoolEmpty):
+		// A pool that cannot be read is a database problem, and provisioning
+		// inline would paper over it while still serving the order. Say so, and
+		// carry on down the slow path.
+		s.Log.Error("could not read the deposit account pool", "order", orderID, "error", err)
+	default:
+		s.Log.Warn("deposit account pool is empty; provisioning inline",
+			"order", orderID)
+	}
+
+	address, encryptedSeed, err := s.Chain.GenerateAccount()
+	if err != nil {
+		return depositAccount{}, fmt.Errorf("generate deposit account: %w", err)
+	}
+
+	// Provision before the address is ever shown. An unprovisioned address
+	// rejects USDC, so publishing one would take the payer's payment and bounce
+	// it.
+	provisionTx, err := s.Chain.Provision(encryptedSeed)
+	if err != nil {
+		return depositAccount{}, fmt.Errorf("provision %s: %w", address, err)
+	}
+
+	s.Log.Info("provisioned a deposit account inline",
+		"order", orderID, "account", address, "tx", provisionTx,
+		"elapsed_ms", time.Since(started).Milliseconds())
+
+	return depositAccount{
+		Address:         address,
+		EncryptedSeed:   encryptedSeed,
+		ProvisionTxHash: provisionTx,
+		Source:          "inline",
+	}, nil
+}
+
+// depositAccount is one usable Stellar address, and where it came from.
+type depositAccount struct {
+	Address         string
+	EncryptedSeed   string
+	ProvisionTxHash string
+	// PoolID is the pool row this came from, or zero when it was provisioned
+	// inline. Needed to put it back if the order it was claimed for is never
+	// saved.
+	PoolID uint
+	// Source is "pool" or "inline", logged so the pool's hit rate — and
+	// therefore whether it is sized correctly — is visible without a query.
+	Source string
 }
 
 func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
@@ -386,6 +481,25 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	}
 	if o.SweepTxHash != "" {
 		payload["sweepTxHash"] = o.SweepTxHash
+	}
+	// The three things a finished order is actually asked about: did the naira
+	// arrive, where did the crypto go if it did not, and why. The status alone
+	// answers none of them, and the poller is the only view a payer who closed
+	// the checkout tab will ever get.
+	if o.PayoutReference != "" {
+		payload["payoutReference"] = o.PayoutReference
+	}
+	if o.RefundTxHash != "" {
+		payload["refundTxHash"] = o.RefundTxHash
+	}
+	if destination := refundDestination(o); destination != "" {
+		payload["refundDestination"] = destination
+	}
+	// The reason an order is where it is, taken from the move that put it
+	// there. It is recorded on the transition rather than the order, because an
+	// order carries one status and a history carries every explanation.
+	if reason := latestReason(s.DB, o.ID); reason != "" {
+		payload["statusReason"] = reason
 	}
 	// Only present when it happened, so a caller cannot mistake the ordinary
 	// false for "we checked and it was fine" on an order predating the check.
@@ -580,4 +694,34 @@ func (s *Server) isAwaitingDeposit(address string) (bool, error) {
 		return false, err
 	}
 	return known.Known && known.AwaitingDeposit, nil
+}
+
+// refundDestination is where this order's refund would go, or went.
+//
+// The payer's own account unless they named somewhere else — the same rule the
+// chain worker applies, repeated here so a caller is told the address that will
+// actually be used rather than only the one that was configured.
+func refundDestination(o *store.Order) string {
+	if o.RefundAddress != "" {
+		return o.RefundAddress
+	}
+	return o.DepositFrom
+}
+
+// latestReason returns the explanation attached to this order's most recent
+// transition, if it had one.
+//
+// Only transitions: a notification row names the status it reported, and its
+// reason is about a delivery attempt rather than about the order.
+func latestReason(db *gorm.DB, orderID string) string {
+	var event store.StatusEvent
+	err := db.
+		Where("order_id = ? AND kind = ?", orderID, store.KindTransition).
+		Where("reason <> ''").
+		Order("at DESC, id DESC").
+		First(&event).Error
+	if err != nil {
+		return ""
+	}
+	return event.Reason
 }

@@ -3,6 +3,7 @@ package stellar
 import (
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/protocols/horizon/operations"
@@ -14,8 +15,10 @@ import (
 // reports zero rather than an error: both are ordinary states for a deposit
 // account that is waiting, and neither is worth failing an order over.
 func (c *Client) USDCBalance(address string) (float64, error) {
+	started := time.Now()
 	account, err := c.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: address})
 	if err != nil {
+		c.call("balance", address, started, filterNotFound(err))
 		if horizonclient.IsNotFoundError(err) {
 			return 0, nil
 		}
@@ -28,9 +31,11 @@ func (c *Client) USDCBalance(address string) (float64, error) {
 			if parseErr != nil {
 				return 0, fmt.Errorf("stellar: parse usdc balance %q: %w", b.Balance, parseErr)
 			}
+			c.call("balance", address, started, nil, "usdc", v)
 			return v, nil
 		}
 	}
+	c.call("balance", address, started, nil, "usdc", 0)
 	return 0, nil
 }
 
@@ -44,8 +49,10 @@ func (c *Client) USDCBalance(address string) (float64, error) {
 // a definite "no". A Horizon outage is not an answer at all, and is returned as
 // an error so a caller does not turn away a good address over a network hiccup.
 func (c *Client) TrustsUSDC(address string) (bool, error) {
+	started := time.Now()
 	account, err := c.horizon.AccountDetail(horizonclient.AccountRequest{AccountID: address})
 	if err != nil {
+		c.call("trustline", address, started, filterNotFound(err))
 		if horizonclient.IsNotFoundError(err) {
 			return false, nil
 		}
@@ -54,10 +61,24 @@ func (c *Client) TrustsUSDC(address string) (bool, error) {
 
 	for _, b := range account.Balances {
 		if b.Asset.Code == c.usdc.Code && b.Asset.Issuer == c.usdc.Issuer {
+			c.call("trustline", address, started, nil, "trusts", true)
 			return true, nil
 		}
 	}
+	c.call("trustline", address, started, nil, "trusts", false)
 	return false, nil
+}
+
+// filterNotFound drops the one Horizon error that is an ordinary answer.
+//
+// A deposit account that does not exist yet is the normal state of an account
+// nobody has paid, and logging it as a failure would make every waiting order
+// look like a problem.
+func filterNotFound(err error) error {
+	if horizonclient.IsNotFoundError(err) {
+		return nil
+	}
+	return describeHorizonError(err)
 }
 
 // DepositInfo identifies the payment that funded a deposit account.
@@ -79,13 +100,16 @@ type DepositInfo struct {
 // Payments come back oldest-first, so the first successful incoming USDC
 // payment is the deposit even after the account has been swept or topped up.
 func (c *Client) Deposit(address string) (DepositInfo, error) {
+	started := time.Now()
 	page, err := c.horizon.Payments(horizonclient.OperationRequest{
 		ForAccount: address,
 		Limit:      50,
 	})
 	if err != nil {
+		c.call("payments", address, started, describeHorizonError(err))
 		return DepositInfo{}, fmt.Errorf("stellar: horizon payments for %s: %w", address, describeHorizonError(err))
 	}
+	c.call("payments", address, started, nil, "records", len(page.Embedded.Records))
 
 	for _, record := range page.Embedded.Records {
 		payment, ok := record.(operations.Payment)

@@ -68,6 +68,27 @@ type StatusEvent struct {
 
 func (StatusEvent) TableName() string { return "stellar_order_status_events" }
 
+// transitionHook is called after every recorded transition.
+//
+// It exists so the workers can be told an order moved instead of finding out on
+// their next poll. Every move an order makes already funnels through the three
+// claim functions and into recordTransition, so this is the one place that sees
+// all of them — and the one place that cannot be forgotten when a new path is
+// added later. Set once at startup, before anything is serving; see
+// OnTransition.
+var transitionHook func(orderID, from, to string)
+
+// OnTransition registers a hook run after each recorded transition.
+//
+// Deliberately one hook rather than a list: there is exactly one caller, the
+// composition root of each binary, and a registry that anything could add to
+// would make "what happens when an order moves" a question you cannot answer by
+// reading a single file.
+//
+// The hook must not block or panic — it runs on the goroutine that just moved
+// money.
+func OnTransition(fn func(orderID, from, to string)) { transitionHook = fn }
+
 // recordTransition stores one move.
 //
 // Best-effort by design, and deliberately not returned to the caller: every
@@ -84,6 +105,13 @@ func recordTransition(db *gorm.DB, orderID, from, to, reason string) {
 		Reason:  reason,
 		At:      time.Now().UTC(),
 	}).Error
+
+	// After the row is written, never before: the worker woken by this will go
+	// looking for exactly that row, and waking it first is a race it would lose
+	// silently by finding nothing and going back to sleep.
+	if transitionHook != nil {
+		transitionHook(orderID, from, to)
+	}
 }
 
 // RecordNotification stores one attempt to report a status downstream.

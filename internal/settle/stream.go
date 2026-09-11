@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 	"gorm.io/gorm"
 )
 
@@ -38,7 +38,12 @@ type Streamer struct {
 	Interval time.Duration
 	Max      int
 
-	idle   pace.Backoff
+	// Bus ends a wait when an order starts waiting for a deposit. The signal
+	// crosses processes: the order is created by the API server, and until it
+	// arrived here the stream that detects the payment in about a second was
+	// itself started up to a minute after the payer was handed the address.
+	Bus *wake.Bus
+
 	mu     sync.Mutex
 	active map[string]context.CancelFunc
 }
@@ -50,21 +55,17 @@ func (s *Streamer) Run(ctx context.Context) {
 		interval = defaultSuperviseInterval
 	}
 	s.active = map[string]context.CancelFunc{}
-	s.Log.Info("deposit streamer started", "interval", interval, "maxStreams", s.max())
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
-
-	for {
-		s.idle.Next(s.supervise(ctx), t, interval)
-		select {
-		case <-ctx.Done():
-			s.stopAll()
-			s.Log.Info("deposit streamer stopped")
-			return
-		case <-t.C:
-		}
-	}
+	wake.Loop{
+		Name:     "deposit streamer",
+		Topic:    wake.Deposits,
+		Interval: interval,
+		Bus:      s.Bus,
+		Log:      s.Log,
+		Fields:   []any{"maxStreams", s.max()},
+		Work:     s.supervise,
+		OnStop:   s.stopAll,
+	}.Run(ctx)
 }
 
 func (s *Streamer) max() int {

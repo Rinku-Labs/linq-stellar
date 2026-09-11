@@ -519,3 +519,86 @@ func TestLocalOrderSkipsTheBackend(t *testing.T) {
 }
 
 var errStub = fmt.Errorf("backend unavailable")
+
+// Order creation must not wait for Stellar. The account is provisioned before
+// anyone asks for it, so accepting an order is a database round-trip — which is
+// also why this test can create one with no Horizon in sight, something the
+// inline path could never do.
+func TestCreateOrderTakesAnAccountFromThePool(t *testing.T) {
+	s, db := testServer(t)
+	t.Cleanup(func() { db.Exec("DELETE FROM stellar_deposit_pool") })
+
+	address, seed, err := s.Chain.GenerateAccount()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	pooled := store.PoolAccount{
+		Address:         address,
+		EncryptedSeed:   seed,
+		Ready:           true,
+		ProvisionTxHash: "provision-tx",
+	}
+	if err := db.Create(&pooled).Error; err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	started := time.Now()
+	w := do(t, s, http.MethodPost, "/orders",
+		`{"idempotencyKey":"key-pool","amountNgn":10000,"rate":1655,"bankCode":"033","bankAccount":"1234567890"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s), want 201", w.Code, w.Body.String())
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Errorf("took %v; a pooled account means no ledger wait", elapsed)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["depositAddress"] != address {
+		t.Errorf("depositAddress = %v, want the pooled account %s", body["depositAddress"], address)
+	}
+
+	// Claimed, and claimed by this order: an account offered twice would settle
+	// one payer's deposit against another payer's invoice.
+	var claimed store.PoolAccount
+	if err := db.First(&claimed, pooled.ID).Error; err != nil {
+		t.Fatalf("reload pool row: %v", err)
+	}
+	if claimed.ClaimedAt == nil {
+		t.Error("the account is still on offer after being handed to an order")
+	}
+	if claimed.OrderID != body["id"] {
+		t.Errorf("pool row names order %q, want %v", claimed.OrderID, body["id"])
+	}
+
+	// And the seed came with it, or nothing could ever sweep the deposit.
+	var order store.Order
+	if err := db.First(&order, "id = ?", body["id"]).Error; err != nil {
+		t.Fatalf("reload order: %v", err)
+	}
+	if order.EncryptedSeed != seed {
+		t.Error("the order did not inherit the pooled account's seed")
+	}
+	if order.Status != store.StateAwaitingDeposit {
+		t.Errorf("status = %q, want %q", order.Status, store.StateAwaitingDeposit)
+	}
+}
+
+// The pool is a buffer, not a dependency. When it is empty the order still has
+// to be attempted the slow way rather than refused — and with no Horizon here,
+// the slow way failing is what proves it was taken.
+func TestAnEmptyPoolFallsBackToProvisioningInline(t *testing.T) {
+	s, _ := testServer(t)
+
+	w := do(t, s, http.MethodPost, "/orders",
+		`{"idempotencyKey":"key-empty-pool","amountNgn":10000,"rate":1655,"bankCode":"033","bankAccount":"1234567890"}`)
+
+	// 503 is the inline path reporting that it could not reach Horizon. What
+	// matters is that it tried: an empty pool must not turn into "no".
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d (%s), want 503 from the inline provisioning attempt",
+			w.Code, w.Body.String())
+	}
+}

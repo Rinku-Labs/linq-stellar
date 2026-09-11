@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/protocols/horizon/operations"
@@ -44,6 +45,11 @@ func (c *Client) StreamUSDCPayments(ctx context.Context, address, cursor string,
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	c.log.Info("horizon payment stream opened",
+		"component", "horizon", "op", "stream:payments",
+		"account", address, "cursor", cursor)
+
+	opened := time.Now()
 	var handlerErr error
 	err := c.horizon.StreamPayments(streamCtx, req, func(op operations.Operation) {
 		payment, ok := op.(operations.Payment)
@@ -59,6 +65,14 @@ func (c *Client) StreamUSDCPayments(ctx context.Context, address, cursor string,
 			cancel()
 			return
 		}
+		// The line that says the money arrived, and when this service first knew
+		// about it. Everything downstream is timed from here, so it is logged
+		// before it is handled rather than after.
+		c.log.Info("horizon payment observed",
+			"component", "horizon", "op", "stream:payments",
+			"account", address, "from", payment.From, "amount", amount,
+			"tx", payment.TransactionHash, "cursor", payment.PagingToken())
+
 		if err := fn(PaymentEvent{
 			TxHash: payment.TransactionHash,
 			From:   payment.From,
@@ -69,6 +83,10 @@ func (c *Client) StreamUSDCPayments(ctx context.Context, address, cursor string,
 			cancel()
 		}
 	})
+
+	c.log.Debug("horizon payment stream closed",
+		"component", "horizon", "op", "stream:payments",
+		"account", address, "open_ms", time.Since(opened).Milliseconds())
 
 	if handlerErr != nil {
 		return handlerErr

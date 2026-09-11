@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 	"gorm.io/gorm"
 )
 
@@ -35,7 +35,10 @@ type Scanner struct {
 	Interval time.Duration
 	Batch    int
 
-	idle pace.Backoff
+	// Bus ends a wait when an order starts waiting for a deposit, so the
+	// backstop is looking at it from the first second rather than from the end
+	// of an interval that widened while the service was quiet.
+	Bus *wake.Bus
 }
 
 // Run sweeps until the context is cancelled.
@@ -44,20 +47,15 @@ func (s *Scanner) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultScanInterval
 	}
-	s.Log.Info("deposit scanner started", "interval", interval)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
-
-	for {
-		s.idle.Next(s.sweep(ctx), t, interval)
-		select {
-		case <-ctx.Done():
-			s.Log.Info("deposit scanner stopped")
-			return
-		case <-t.C:
-		}
-	}
+	wake.Loop{
+		Name:     "deposit scanner",
+		Topic:    wake.Deposits,
+		Interval: interval,
+		Bus:      s.Bus,
+		Log:      s.Log,
+		Work:     s.sweep,
+	}.Run(ctx)
 }
 
 // sweep runs one pass. It recovers on its own so one bad cycle — a malformed

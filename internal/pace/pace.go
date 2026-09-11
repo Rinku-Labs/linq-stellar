@@ -17,18 +17,21 @@ const MaxIdleInterval = 2 * time.Minute
 //
 // Work resets the interval immediately, so a busy service still behaves as if
 // it were polling constantly. Only idleness is slowed down.
+//
+// Widening an interval is safe only because it no longer decides how long work
+// waits: a worker that is signalled (internal/wake) stops waiting at once,
+// however far it had drifted. Before signals existed this backoff was also the
+// service's latency, and a deposit could sit for the two minutes above with
+// nothing wrong except that nobody was due to look.
 type Backoff struct {
 	misses int
 }
 
-// Next widens or resets the ticker based on whether the last pass found work.
-func (b *Backoff) Next(worked bool, t *time.Ticker, base time.Duration) {
+// Next reports how long to wait before the next pass.
+func (b *Backoff) Next(worked bool, base time.Duration) time.Duration {
 	if worked {
-		if b.misses > 0 {
-			b.misses = 0
-			t.Reset(base)
-		}
-		return
+		b.Reset()
+		return base
 	}
 
 	// Doubling, capped at four steps, so the interval grows 2x, 4x, 8x, 16x and
@@ -40,5 +43,8 @@ func (b *Backoff) Next(worked bool, t *time.Ticker, base time.Duration) {
 	if d > MaxIdleInterval {
 		d = MaxIdleInterval
 	}
-	t.Reset(d)
+	return d
 }
+
+// Reset returns the loop to its base interval.
+func (b *Backoff) Reset() { b.misses = 0 }

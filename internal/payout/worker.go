@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 	"gorm.io/gorm"
 )
 
@@ -37,7 +37,10 @@ type Worker struct {
 	Interval time.Duration
 	Batch    int
 
-	idle pace.Backoff
+	// Bus ends a wait as soon as a deposit is confirmed, so a payout starts in
+	// the same second rather than at whatever point this loop's interval next
+	// came round.
+	Bus *wake.Bus
 }
 
 // Run processes payouts until the context is cancelled.
@@ -46,20 +49,15 @@ func (w *Worker) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	w.Log.Info("payout worker started", "interval", interval)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
-
-	for {
-		w.idle.Next(w.sweep(ctx), t, interval)
-		select {
-		case <-ctx.Done():
-			w.Log.Info("payout worker stopped")
-			return
-		case <-t.C:
-		}
-	}
+	wake.Loop{
+		Name:     "payout worker",
+		Topic:    wake.Payouts,
+		Interval: interval,
+		Bus:      w.Bus,
+		Log:      w.Log,
+		Work:     w.sweep,
+	}.Run(ctx)
 }
 
 func (w *Worker) sweep(ctx context.Context) (found bool) {

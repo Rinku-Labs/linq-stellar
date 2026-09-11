@@ -121,6 +121,7 @@ key and nothing can sweep or reclaim them afterwards.
 | `STELLAR_SCAN_INTERVAL` | `15s` | Polling backstop cadence |
 | `STELLAR_DEPOSIT_WINDOW` | `30m` | How long an order waits for its deposit |
 | `STELLAR_MAX_STREAMS` | `200` | Concurrent Horizon streams; past this, orders fall back to polling |
+| `STELLAR_ACCOUNT_POOL` | `10` | Deposit accounts kept provisioned ahead of demand, so `POST /orders` costs a database round-trip instead of a ledger close. `0` disables it and returns to provisioning inline. Each waiting account holds ~1 XLM of sponsor reserves, returned when the account is merged back after settlement |
 | `STELLAR_BASE_FEE` | `10000` stroops | Headroom for network congestion |
 
 ### SEP-10 (optional, all three or none)
