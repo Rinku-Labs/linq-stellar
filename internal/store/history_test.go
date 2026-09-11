@@ -169,6 +169,66 @@ func TestFailureToRecoveryIsTimeable(t *testing.T) {
 	}
 }
 
+// Transitions and delivery attempts share one ordered timeline, so an order's
+// whole story is a single fetch rather than two lists to merge by hand.
+func TestTimelineHoldsTransitionsAndNotifications(t *testing.T) {
+	db := historyDB(t)
+	seedOrder(t, db, StateDepositDetected)
+
+	if _, err := ClaimStatus(db, "ord_hist", StateDepositDetected, StatePayoutQueued); err != nil {
+		t.Fatal(err)
+	}
+	RecordNotification(db, "ord_hist", StatePayoutQueued, "attempt 1 failed after 20ms: connection refused")
+	RecordNotification(db, "ord_hist", StatePayoutQueued, "delivered in 412ms")
+
+	events, err := StatusHistory(db, "ord_hist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("timeline has %d events, want 3", len(events))
+	}
+
+	var transitions, notifications int
+	for _, e := range events {
+		switch e.Kind {
+		case KindTransition:
+			transitions++
+		case KindNotification:
+			notifications++
+		default:
+			t.Errorf("event has unknown kind %q", e.Kind)
+		}
+	}
+	if transitions != 1 || notifications != 2 {
+		t.Errorf("got %d transitions and %d notifications, want 1 and 2", transitions, notifications)
+	}
+	// The failed attempt must survive: a timeline showing only the delivery
+	// that worked hides how long the merchant actually waited.
+	if events[1].Reason == "" {
+		t.Error("the failed delivery attempt lost its reason")
+	}
+}
+
+// A notification names the status it reported, so it must not be mistaken for
+// the order reaching that status — that would time to the announcement rather
+// than to the event.
+func TestTimingIgnoresNotificationRows(t *testing.T) {
+	db := historyDB(t)
+	seedOrder(t, db, StateDepositDetected)
+
+	// Announce refund_queued before the order ever gets there.
+	RecordNotification(db, "ord_hist", StateRefundQueued, "delivered in 5ms")
+	if _, err := ClaimStatus(db, "ord_hist", StateDepositDetected, StatePayoutQueued); err != nil {
+		t.Fatal(err)
+	}
+
+	events, _ := StatusHistory(db, "ord_hist")
+	if _, ok := ElapsedBetween(events, StatePayoutQueued, StateRefundQueued); ok {
+		t.Error("measured to refund_queued from a notification row; the order never reached it")
+	}
+}
+
 // Measuring between states an order never reached must report "not measured"
 // rather than a zero duration that reads as instantaneous success.
 func TestElapsedRefusesToInventDurations(t *testing.T) {

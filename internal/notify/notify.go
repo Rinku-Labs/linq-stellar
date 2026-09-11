@@ -215,6 +215,9 @@ func (w *Worker) deliver(ctx context.Context, order *store.Order) {
 			"attempt", order.NotifyAttempts+1,
 			"elapsed_ms", time.Since(start).Milliseconds(),
 			"error", err)
+		store.RecordNotification(w.DB, order.ID, status,
+			fmt.Sprintf("attempt %d failed after %dms: %v",
+				order.NotifyAttempts+1, time.Since(start).Milliseconds(), err))
 		w.backOff(order)
 		return
 	}
@@ -233,10 +236,14 @@ func (w *Worker) deliver(ctx context.Context, order *store.Order) {
 		return
 	}
 
+	elapsed := time.Since(start)
+	store.RecordNotification(w.DB, order.ID, status,
+		fmt.Sprintf("delivered in %dms", elapsed.Milliseconds()))
+
 	w.Log.Info("merchant notified",
 		"order", order.ID,
 		"status", status,
-		"elapsed_ms", time.Since(start).Milliseconds())
+		"elapsed_ms", elapsed.Milliseconds())
 }
 
 // post sends one signed delivery.

@@ -20,16 +20,31 @@ import (
 // it is written from the same three functions that move an order, so a
 // transition cannot happen without being recorded.
 
-// StatusEvent is one recorded transition.
+// Event kinds. One table rather than two, because the question being asked is
+// "what happened to this order, in order" — and an answer that makes you merge
+// two lists by timestamp yourself is not one timeline, it is two.
+const (
+	// KindTransition is a move between lifecycle states.
+	KindTransition = "transition"
+	// KindNotification is an attempt to tell the Linq backend about one.
+	KindNotification = "notification"
+)
+
+// StatusEvent is one recorded thing that happened to an order.
 type StatusEvent struct {
 	ID      uint   `gorm:"primaryKey" json:"-"`
 	OrderID string `gorm:"index;size:255" json:"-"`
-	// From is empty for the first event of an order's life.
-	From string `json:"from"`
+	// Kind distinguishes a state change from an attempt to report one.
+	// Defaults to KindTransition for rows written before this existed.
+	Kind string `gorm:"index;default:transition" json:"kind"`
+	// From is empty for the first event of an order's life, and for
+	// notifications, which describe a status rather than a move between two.
+	From string `json:"from,omitempty"`
 	To   string `json:"to"`
 	// Reason explains a move that was not the happy path — a payout provider's
-	// rejection, say. Empty when the transition speaks for itself.
-	Reason string `json:"reason,omitempty"`
+	// rejection, say — or why a delivery failed. Empty when the event speaks
+	// for itself.
+	Reason string    `json:"reason,omitempty"`
 	At     time.Time `json:"at"`
 }
 
@@ -45,8 +60,28 @@ func (StatusEvent) TableName() string { return "stellar_order_status_events" }
 func recordTransition(db *gorm.DB, orderID, from, to, reason string) {
 	_ = db.Create(&StatusEvent{
 		OrderID: orderID,
+		Kind:    KindTransition,
 		From:    from,
 		To:      to,
+		Reason:  reason,
+		At:      time.Now().UTC(),
+	}).Error
+}
+
+// RecordNotification stores one attempt to report a status downstream.
+//
+// Written to the same table as the transitions so an order's history is a
+// single ordered account of what happened and who was told. Keeping delivery
+// attempts only in the container log would mean the two halves of every
+// incident — the order moved, nobody was told — live in different systems, and
+// only one of them can be handed to someone else.
+//
+// Best-effort, for the same reason as recordTransition.
+func RecordNotification(db *gorm.DB, orderID, status, reason string) {
+	_ = db.Create(&StatusEvent{
+		OrderID: orderID,
+		Kind:    KindNotification,
+		To:      status,
 		Reason:  reason,
 		At:      time.Now().UTC(),
 	}).Error
@@ -69,6 +104,12 @@ func StatusHistory(db *gorm.DB, orderID string) ([]StatusEvent, error) {
 func ElapsedBetween(events []StatusEvent, from, to string) (time.Duration, bool) {
 	var start, end time.Time
 	for _, e := range events {
+		// Transitions only. A notification row names the status it reported,
+		// so counting one as an arrival would measure to the moment a state
+		// was announced rather than the moment it was reached.
+		if e.Kind == KindNotification {
+			continue
+		}
 		if start.IsZero() && e.To == from {
 			start = e.At
 		}
