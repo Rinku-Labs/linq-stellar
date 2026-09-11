@@ -74,6 +74,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /sep10/auth", s.handleVerify)
 
 	mux.HandleFunc("GET /stellar/trustline", s.handleTrustline)
+	// Unauthenticated by design; the transaction is the credential. See
+	// handleSubmit.
+	mux.HandleFunc("POST /stellar/submit", s.handleSubmit)
 	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
 
@@ -448,4 +451,65 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		log.Info("request", "method", r.Method, "path", r.URL.Path, "took", time.Since(start))
 	})
+}
+
+// handleSubmit fee-bumps and submits a payment the payer has already signed.
+//
+// This is what makes "zero fees deducted from the user's wallet" literally
+// true. Without it the payer signs their own transaction and pays its network
+// fee; with it the sponsor is billed for the fee and the payer's account is
+// touched for nothing but the USDC they meant to send.
+//
+// It is deliberately unauthenticated, because the caller is a browser and any
+// key shipped there is public. The credential is the transaction itself: this
+// will only pay a fee for a plain USDC payment into a deposit account this
+// service minted and is currently expecting money for. Anything else is
+// refused, so the worst an arbitrary caller can do is pay us.
+func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Transaction string `json:"transaction"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Transaction == "" {
+		writeError(w, http.StatusBadRequest, "a signed transaction is required")
+		return
+	}
+
+	intent, err := stellar.InspectUSDCPayment(body.Transaction, s.Chain.USDCAsset())
+	if err != nil {
+		s.Log.Info("refused to sponsor a transaction", "error", err)
+		writeError(w, http.StatusBadRequest,
+			"this service only sponsors USDC payments into its own deposit addresses")
+		return
+	}
+
+	// Every destination must be an address we are waiting on. Checking the
+	// state as well as the address matters: a settled order's account has been
+	// merged away, so sponsoring a payment to it would burn a fee on a
+	// transaction destined to fail.
+	for _, destination := range intent.Destinations {
+		var count int64
+		if err := s.DB.Model(&store.Order{}).
+			Where("deposit_address = ? AND status = ?", destination, store.StateAwaitingDeposit).
+			Count(&count).Error; err != nil {
+			s.Log.Error("could not check deposit address", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "could not verify the payment right now")
+			return
+		}
+		if count == 0 {
+			s.Log.Info("refused to sponsor a payment to an unknown address", "destination", destination)
+			writeError(w, http.StatusBadRequest,
+				"this service only sponsors payments into its own deposit addresses")
+			return
+		}
+	}
+
+	hash, err := s.Chain.FeeBumpAndSubmit(body.Transaction)
+	if err != nil {
+		s.Log.Error("could not submit fee-bumped payment", "error", err)
+		writeError(w, http.StatusBadGateway, "the payment could not be submitted; nothing was sent")
+		return
+	}
+
+	s.Log.Info("sponsored a payer's network fee", "tx", hash, "usdc", intent.Total)
+	writeJSON(w, http.StatusOK, map[string]any{"hash": hash, "feeSponsored": true})
 }

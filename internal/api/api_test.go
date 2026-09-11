@@ -382,3 +382,52 @@ func TestPreflightSucceeds(t *testing.T) {
 		t.Errorf("Allow-Methods = %q, want it to include POST", got)
 	}
 }
+
+// The submit endpoint spends our XLM on someone else's transaction, and the
+// caller is a browser where no key can be kept secret. These cases are the
+// actual security boundary: what the transaction does is the credential.
+func TestSubmitRefusesWhatItWillNotSponsor(t *testing.T) {
+	s, _ := testServer(t)
+
+	cases := map[string]string{
+		"no body":              ``,
+		"empty transaction":    `{"transaction":""}`,
+		"unparseable xdr":      `{"transaction":"not-a-transaction"}`,
+		"valid base64, not tx": `{"transaction":"aGVsbG8gd29ybGQ="}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := do(t, s, http.MethodPost, "/stellar/submit", body)
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", w.Code)
+			}
+		})
+	}
+}
+
+// A payment to an address we do not own, or one we are no longer expecting
+// money for, must not be sponsored — otherwise anyone could have us pay the
+// fees on arbitrary traffic.
+func TestSubmitRefusesUnknownDestination(t *testing.T) {
+	_, db := testServer(t)
+
+	// An order that exists but has already settled: its deposit account has
+	// been merged away, so sponsoring a payment to it would burn a fee on a
+	// transaction that cannot succeed.
+	db.Create(&store.Order{
+		ID:             "settled-order",
+		IdempotencyKey: "settled-key",
+		Status:         store.StateSettledInTreasury,
+		DepositAddress: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+	})
+
+	var awaiting int64
+	db.Model(&store.Order{}).
+		Where("deposit_address = ? AND status = ?",
+			"GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+			store.StateAwaitingDeposit).
+		Count(&awaiting)
+	if awaiting != 0 {
+		t.Fatalf("a settled order counted as awaiting deposit (%d); the guard would sponsor it", awaiting)
+	}
+}
