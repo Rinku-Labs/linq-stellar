@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/Rinku-Labs/linq-stellar/internal/config"
+	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/settle"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
@@ -82,9 +83,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Four loops, run together. The streamer detects deposits in about a
+	// Five loops, run together. The streamer detects deposits in about a
 	// second; the scanner is the backstop that catches whatever the streamer
 	// dropped across a reconnect. Both enter settlement through the same claim.
+	// The notifier is what tells the Linq backend any of it happened.
 	workers := []func(context.Context){
 		(&settle.Streamer{
 			DB: db, Deposits: deposits, Log: log, Max: cfg.MaxStreams,
@@ -97,6 +99,12 @@ func run() error {
 		}).Run,
 		(&settle.ChainWorker{
 			DB: db, Chain: chain, Treasury: cfg.TreasuryWallet, Log: log,
+		}).Run,
+		(&notify.Worker{
+			DB:     db,
+			Log:    log,
+			URL:    cfg.MerchantWebhookURL,
+			Secret: cfg.MerchantWebhookSecret,
 		}).Run,
 	}
 
