@@ -229,11 +229,28 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		return
 	}
 
+	// Logged before the attempt, not only after it. A delivery that hangs or
+	// dies mid-flight leaves no success line and no failure line, so without
+	// this the log simply has a gap where the webhook was — and a gap is
+	// indistinguishable from never having tried.
+	w.Log.Info("sending merchant webhook",
+		"order", ev.OrderID,
+		"event", event.Event,
+		"status", status,
+		"url", w.URL,
+		"occurred_at", ev.At.Format(time.RFC3339),
+		"attempt", ev.NotifyAttempts+1,
+		"signed", w.Secret != "",
+		"bytes", len(body))
+
 	start := time.Now()
-	if err := w.post(ctx, body); err != nil {
-		w.Log.Warn("merchant notification failed, will retry",
+	code, err := w.post(ctx, body)
+	if err != nil {
+		w.Log.Warn("merchant webhook failed, will retry",
 			"order", ev.OrderID,
 			"status", status,
+			"url", w.URL,
+			"http_status", code,
 			"attempt", ev.NotifyAttempts+1,
 			"elapsed_ms", time.Since(start).Milliseconds(),
 			"error", err)
@@ -264,21 +281,31 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		fmt.Sprintf("delivered in %dms (%s lag from the event)",
 			elapsed.Milliseconds(), now.Sub(ev.At).Round(time.Millisecond)))
 
-	w.Log.Info("merchant notified",
+	w.Log.Info("merchant webhook delivered",
 		"order", ev.OrderID,
+		"event", event.Event,
 		"status", status,
+		"url", w.URL,
+		"http_status", code,
 		"elapsed_ms", elapsed.Milliseconds(),
+		// How long the merchant actually waited: from the thing happening to
+		// them being told. The number the whole pipeline is judged on.
 		"lag_ms", now.Sub(ev.At).Milliseconds())
 }
 
-// post sends one signed delivery.
-func (w *Worker) post(ctx context.Context, body []byte) error {
+// post sends one signed delivery, returning the receiver's status code.
+//
+// The code comes back even on the error path: "the receiver said 401" and "the
+// receiver never answered" are different problems with different fixes, and a
+// log line that flattens both into "failed" sends you looking in the wrong
+// place.
+func (w *Worker) post(ctx context.Context, body []byte) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, deliveryTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if w.Secret != "" {
@@ -289,7 +316,7 @@ func (w *Worker) post(ctx context.Context, body []byte) error {
 
 	resp, err := w.HTTP.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	// Drained so the connection can be reused rather than dropped after every
@@ -297,9 +324,9 @@ func (w *Worker) post(ctx context.Context, body []byte) error {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("receiver returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return resp.StatusCode, fmt.Errorf("receiver returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // backOff records a failed attempt and schedules the next one.
