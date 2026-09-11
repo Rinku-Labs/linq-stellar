@@ -112,7 +112,12 @@ func run() error {
 		"sponsor", chain.SponsorAddress(),
 		"treasury", cfg.TreasuryWallet,
 		"usdcIssuer", chain.USDCAsset().Issuer,
-		"horizon", cfg.HorizonURL)
+		// The resolved endpoint, not the raw setting. STELLAR_HORIZON_URL is
+		// optional and falls back to the public network, so logging the config
+		// value printed an empty string on every default deployment and left
+		// the one question this line exists to answer — which Horizon are we
+		// actually talking to — unanswered.
+		"horizon", chain.Horizon().HorizonURL)
 
 	var wg sync.WaitGroup
 	for _, w := range workers {

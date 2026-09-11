@@ -46,6 +46,24 @@ type StatusEvent struct {
 	// for itself.
 	Reason string    `json:"reason,omitempty"`
 	At     time.Time `json:"at"`
+
+	// --- Delivery bookkeeping, for KindTransition rows ---
+	//
+	// Reporting is tracked per transition rather than per order, because an
+	// order can pass through a state worth reporting faster than anyone polls
+	// for it. Keyed off the order's current status, a payout that failed and
+	// was queued for refund within one poll interval reported neither — the
+	// merchant heard "refunded" a minute later and was never told the payout
+	// failed at all. A transition, once recorded, does not stop having
+	// happened.
+
+	// NotifiedAt is when this transition was successfully reported. Nil means
+	// still owed.
+	NotifiedAt *time.Time `gorm:"index" json:"notifiedAt,omitempty"`
+	// NotifyAttempts counts failed deliveries of this transition.
+	NotifyAttempts int `gorm:"default:0" json:"-"`
+	// NotifyAfter holds off the next attempt after a failure.
+	NotifyAfter *time.Time `gorm:"index" json:"-"`
 }
 
 func (StatusEvent) TableName() string { return "stellar_order_status_events" }

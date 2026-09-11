@@ -84,7 +84,16 @@ type Event struct {
 	TxHash    string  `json:"txHash,omitempty"`
 	Underpaid bool    `json:"underpaid,omitempty"`
 	Shortfall float64 `json:"shortfallNgn,omitempty"`
-	Timestamp string  `json:"timestamp"`
+	// Reason carries why, for the states where "why" is the message — a
+	// payout rejected by the provider, say. The receiving side shows it to
+	// the merchant rather than making them ask.
+	Reason string `json:"reason,omitempty"`
+	// OccurredAt is when the transition happened; Timestamp is when it was
+	// sent. They differ after a retry or an outage, and a receiver that
+	// treats the send time as the event time will misreport how long
+	// something took.
+	OccurredAt string `json:"occurredAt"`
+	Timestamp  string `json:"timestamp"`
 }
 
 // Worker delivers pending status changes.
@@ -153,97 +162,113 @@ func (w *Worker) sweep(ctx context.Context) (found bool) {
 		states = append(states, s)
 	}
 
-	var orders []store.Order
-	// "status is ahead of what was delivered". The NULL arm is not optional:
-	// every order predating this column has a NULL notified_status, and
-	// `notified_status <> status` is unknown rather than true against NULL, so
-	// without it exactly the backlog this package exists to drain is the part
-	// it would never select.
+	// Owed transitions, oldest first — not orders whose current status differs
+	// from what was reported. The difference matters: an order that passes
+	// through a reportable state faster than this loop runs still owes that
+	// report, and ordering by when the move happened means the merchant reads
+	// the story in the order it occurred rather than only its ending.
+	var events []store.StatusEvent
 	if err := w.DB.
-		Where("(notified_status IS NULL OR notified_status <> status)").
-		Where("status IN ?", states).
+		Where("kind = ?", store.KindTransition).
+		// Quoted: "to" is a reserved word, and the column is named for the
+		// struct field rather than around SQL's vocabulary.
+		Where(`"to" IN ?`, states).
+		Where("notified_at IS NULL").
 		Where("notify_after IS NULL OR notify_after <= ?", time.Now().UTC()).
-		Order("updated_at ASC").
+		Order("at ASC, id ASC").
 		Limit(batch).
-		Find(&orders).Error; err != nil {
+		Find(&events).Error; err != nil {
 		w.Log.Error("notify sweep query failed", "error", err)
 		return false
 	}
 
-	for i := range orders {
+	for i := range events {
 		if ctx.Err() != nil {
-			return len(orders) > 0
+			return len(events) > 0
 		}
-		w.deliver(ctx, &orders[i])
+		w.deliverEvent(ctx, &events[i])
 	}
-	return len(orders) > 0
+	return len(events) > 0
 }
 
-// deliver posts one order's current status and records the outcome.
-func (w *Worker) deliver(ctx context.Context, order *store.Order) {
-	// The status is re-read from the row the moment before sending, so the
-	// event describes the order as it is now rather than as the batch query
-	// found it. An order that moved on in between is delivered at its newer
-	// state and the older one is skipped — the merchant wants to know where
-	// their money is, not every step it took to get there.
-	status := order.Status
+// deliverEvent posts one recorded transition and records the outcome.
+func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
+	status := ev.To
+
+	// The order is read for the figures — amounts, hashes — but the status
+	// reported is the transition's, not the order's current one. An order that
+	// has moved on since still owes this report: "your payout failed" is not
+	// made untrue by a refund landing afterwards, and a merchant who only ever
+	// hears the ending cannot tell a payment that worked from one that was
+	// undone.
+	var order store.Order
+	if err := w.DB.First(&order, "id = ?", ev.OrderID).Error; err != nil {
+		w.Log.Error("could not load order for notification", "order", ev.OrderID, "error", err)
+		w.backOff(ev)
+		return
+	}
 
 	event := Event{
 		Event:     "order." + status,
-		OrderID:   order.ID,
+		OrderID:   ev.OrderID,
 		Status:    status,
 		AmountNGN: order.AmountNGN,
 		AmountUSD: order.AmountUSDC,
 		TxHash:    order.DepositTxHash,
 		Underpaid: order.Underpaid,
 		Shortfall: order.ShortfallNGN,
+		Reason:    ev.Reason,
+		OccurredAt: ev.At.Format(time.RFC3339),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 
 	body, err := json.Marshal(event)
 	if err != nil {
-		w.Log.Error("could not encode notification", "order", order.ID, "error", err)
-		w.backOff(order)
+		w.Log.Error("could not encode notification", "order", ev.OrderID, "error", err)
+		w.backOff(ev)
 		return
 	}
 
 	start := time.Now()
 	if err := w.post(ctx, body); err != nil {
 		w.Log.Warn("merchant notification failed, will retry",
-			"order", order.ID,
+			"order", ev.OrderID,
 			"status", status,
-			"attempt", order.NotifyAttempts+1,
+			"attempt", ev.NotifyAttempts+1,
 			"elapsed_ms", time.Since(start).Milliseconds(),
 			"error", err)
-		store.RecordNotification(w.DB, order.ID, status,
+		store.RecordNotification(w.DB, ev.OrderID, status,
 			fmt.Sprintf("attempt %d failed after %dms: %v",
-				order.NotifyAttempts+1, time.Since(start).Milliseconds(), err))
-		w.backOff(order)
+				ev.NotifyAttempts+1, time.Since(start).Milliseconds(), err))
+		w.backOff(ev)
 		return
 	}
 
-	if err := w.DB.Model(&store.Order{}).
-		Where("id = ?", order.ID).
+	elapsed := time.Since(start)
+	now := time.Now().UTC()
+	if err := w.DB.Model(&store.StatusEvent{}).
+		Where("id = ?", ev.ID).
 		Updates(map[string]any{
-			"notified_status": status,
+			"notified_at":     now,
 			"notify_attempts": 0,
 			"notify_after":    nil,
 		}).Error; err != nil {
 		// The delivery landed but the record of it did not. The receiver is
 		// idempotent per order and status, so the duplicate this causes on the
 		// next pass is harmless; losing the notification would not be.
-		w.Log.Error("could not record notification", "order", order.ID, "error", err)
+		w.Log.Error("could not record notification", "order", ev.OrderID, "error", err)
 		return
 	}
 
-	elapsed := time.Since(start)
-	store.RecordNotification(w.DB, order.ID, status,
-		fmt.Sprintf("delivered in %dms", elapsed.Milliseconds()))
+	store.RecordNotification(w.DB, ev.OrderID, status,
+		fmt.Sprintf("delivered in %dms (%s lag from the event)",
+			elapsed.Milliseconds(), now.Sub(ev.At).Round(time.Millisecond)))
 
 	w.Log.Info("merchant notified",
-		"order", order.ID,
+		"order", ev.OrderID,
 		"status", status,
-		"elapsed_ms", elapsed.Milliseconds())
+		"elapsed_ms", elapsed.Milliseconds(),
+		"lag_ms", now.Sub(ev.At).Milliseconds())
 }
 
 // post sends one signed delivery.
@@ -278,8 +303,8 @@ func (w *Worker) post(ctx context.Context, body []byte) error {
 }
 
 // backOff records a failed attempt and schedules the next one.
-func (w *Worker) backOff(order *store.Order) {
-	attempts := order.NotifyAttempts + 1
+func (w *Worker) backOff(ev *store.StatusEvent) {
+	attempts := ev.NotifyAttempts + 1
 
 	wait := retryBase << min(attempts-1, 16)
 	if wait > retryCap || wait <= 0 {
@@ -287,12 +312,12 @@ func (w *Worker) backOff(order *store.Order) {
 	}
 	next := time.Now().UTC().Add(wait)
 
-	if err := w.DB.Model(&store.Order{}).
-		Where("id = ?", order.ID).
+	if err := w.DB.Model(&store.StatusEvent{}).
+		Where("id = ?", ev.ID).
 		Updates(map[string]any{
 			"notify_attempts": attempts,
 			"notify_after":    next,
 		}).Error; err != nil {
-		w.Log.Error("could not record notification failure", "order", order.ID, "error", err)
+		w.Log.Error("could not record notification failure", "order", ev.OrderID, "error", err)
 	}
 }
