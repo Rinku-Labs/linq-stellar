@@ -17,6 +17,7 @@ import (
 
 	"github.com/Rinku-Labs/linq-stellar/internal/api"
 	"github.com/Rinku-Labs/linq-stellar/internal/config"
+	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
@@ -63,9 +64,19 @@ func run() error {
 		return err
 	}
 
+	// Lets fee sponsorship recognise deposit addresses minted by the Linq
+	// backend — everything from the consumer app. Without it only this
+	// service's own orders qualify, and consumer payers keep paying their own
+	// network fee.
+	depositLookup, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
+	if err != nil {
+		return err
+	}
+
 	srv := &api.Server{
 		DB:            db,
 		Chain:         chain,
+		DepositLookup: depositLookup,
 		HomeDomain:    cfg.HomeDomain,
 		DepositWindow: cfg.DepositWindow,
 		OrdersAPIKey:  cfg.OrdersAPIKey,

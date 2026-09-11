@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
@@ -431,3 +433,89 @@ func TestSubmitRefusesUnknownDestination(t *testing.T) {
 		t.Fatalf("a settled order counted as awaiting deposit (%d); the guard would sponsor it", awaiting)
 	}
 }
+
+// stubLookup stands in for the Linq backend's deposit-address check.
+type stubLookup struct {
+	known    payout.KnownDepositAddress
+	err      error
+	calls    int
+	lastAddr string
+}
+
+func (s *stubLookup) LookupDepositAddress(address string) (payout.KnownDepositAddress, error) {
+	s.calls++
+	s.lastAddr = address
+	return s.known, s.err
+}
+
+// Consumer-app orders live in the Linq backend, so an address this service has
+// never seen still has to be sponsorable — otherwise fee-bumping is dead code
+// for exactly the payers it was built for.
+func TestAwaitingDepositFallsBackToTheLinqBackend(t *testing.T) {
+	s, _ := testServer(t)
+	lookup := &stubLookup{known: payout.KnownDepositAddress{Known: true, AwaitingDeposit: true}}
+	s.DepositLookup = lookup
+
+	ok, err := s.isAwaitingDeposit("GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if !ok {
+		t.Error("an address the backend owns was not recognised")
+	}
+	if lookup.calls != 1 {
+		t.Errorf("backend called %d times, want 1", lookup.calls)
+	}
+}
+
+// An address the backend knows but has already settled must not be sponsored:
+// its deposit account has been merged away, so the fee would buy a transaction
+// that cannot succeed.
+func TestSettledAddressIsNotSponsored(t *testing.T) {
+	s, _ := testServer(t)
+	s.DepositLookup = &stubLookup{known: payout.KnownDepositAddress{Known: true, AwaitingDeposit: false}}
+
+	ok, err := s.isAwaitingDeposit("GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H")
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if ok {
+		t.Error("sponsored a payment to an address that is no longer awaiting a deposit")
+	}
+}
+
+// An unreachable backend must surface as an error, not as a quiet "not ours".
+// Read as a refusal it would switch sponsorship off for every consumer payment
+// during any blip, and the only symptom would be payers paying their own fees.
+func TestLookupFailureIsAnErrorNotARefusal(t *testing.T) {
+	s, _ := testServer(t)
+	s.DepositLookup = &stubLookup{err: errStub}
+
+	if _, err := s.isAwaitingDeposit("GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H"); err == nil {
+		t.Error("an unreachable backend was treated as a definite answer")
+	}
+}
+
+// A local order must not cost a round trip.
+func TestLocalOrderSkipsTheBackend(t *testing.T) {
+	s, db := testServer(t)
+	lookup := &stubLookup{}
+	s.DepositLookup = lookup
+
+	db.Create(&store.Order{
+		ID:             "awaiting",
+		IdempotencyKey: "awaiting-key",
+		Status:         store.StateAwaitingDeposit,
+		DepositAddress: "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H",
+	})
+
+	ok, err := s.isAwaitingDeposit("GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFSHONUCEOASW7QC7OX2H")
+	if err != nil || !ok {
+		t.Fatalf("local order not recognised: ok=%v err=%v", ok, err)
+	}
+	if lookup.calls != 0 {
+		t.Errorf("backend called %d times for a local order, want 0", lookup.calls)
+	}
+}
+
+var errStub = fmt.Errorf("backend unavailable")

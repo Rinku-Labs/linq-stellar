@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Rinku-Labs/linq-stellar/internal/money"
+	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
@@ -25,6 +26,12 @@ type Server struct {
 	Chain *stellar.Client
 	Auth  *sep.Authenticator // nil when SEP-10 is not configured
 	TOML  sep.TOMLConfig
+
+	// DepositLookup asks the Linq backend whether an address is one of its
+	// deposit accounts. Consumer-app orders live there rather than here, so
+	// without it fee sponsorship would refuse every one of them. Optional: with
+	// no lookup configured only this service's own orders are sponsored.
+	DepositLookup DepositLookup
 
 	HomeDomain    string
 	DepositWindow time.Duration
@@ -192,6 +199,12 @@ func (s *Server) handleTrustline(w http.ResponseWriter, r *http.Request) {
 		"assetCode":   "USDC",
 		"assetIssuer": s.Chain.USDCAsset().Issuer,
 	})
+}
+
+// DepositLookup reports whether an address is a deposit account the Linq
+// backend minted and is still expecting payment into.
+type DepositLookup interface {
+	LookupDepositAddress(address string) (payout.KnownDepositAddress, error)
 }
 
 // CreateOrderRequest is the payload for a new Stellar off-ramp order.
@@ -482,25 +495,34 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Every destination must be an address we are waiting on. Checking the
-	// state as well as the address matters: a settled order's account has been
-	// merged away, so sponsoring a payment to it would burn a fee on a
-	// transaction destined to fail.
+	// At least one operation must pay a deposit account Linq owns and is still
+	// expecting money for. Checking the state as well as the address matters: a
+	// settled order's account has been merged away, so sponsoring a payment to
+	// it would burn a fee on a transaction destined to fail.
+	//
+	// Only one, rather than all: the consumer app can attach a savings transfer
+	// to the same transaction, paying the user's own savings address alongside
+	// the deposit. Demanding every destination be ours would refuse exactly the
+	// payments this exists to sponsor. The fee is a fixed few stroops per
+	// operation either way, and the payment reaching us is what earns it.
+	sponsored := false
 	for _, destination := range intent.Destinations {
-		var count int64
-		if err := s.DB.Model(&store.Order{}).
-			Where("deposit_address = ? AND status = ?", destination, store.StateAwaitingDeposit).
-			Count(&count).Error; err != nil {
-			s.Log.Error("could not check deposit address", "error", err)
+		ok, err := s.isAwaitingDeposit(destination)
+		if err != nil {
+			s.Log.Error("could not check deposit address", "destination", destination, "error", err)
 			writeError(w, http.StatusServiceUnavailable, "could not verify the payment right now")
 			return
 		}
-		if count == 0 {
-			s.Log.Info("refused to sponsor a payment to an unknown address", "destination", destination)
-			writeError(w, http.StatusBadRequest,
-				"this service only sponsors payments into its own deposit addresses")
-			return
+		if ok {
+			sponsored = true
+			break
 		}
+	}
+	if !sponsored {
+		s.Log.Info("refused to sponsor a payment to unknown addresses", "destinations", intent.Destinations)
+		writeError(w, http.StatusBadRequest,
+			"this service only sponsors payments into Linq deposit addresses")
+		return
 	}
 
 	hash, err := s.Chain.FeeBumpAndSubmit(body.Transaction)
@@ -512,4 +534,37 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	s.Log.Info("sponsored a payer's network fee", "tx", hash, "usdc", intent.Total)
 	writeJSON(w, http.StatusOK, map[string]any{"hash": hash, "feeSponsored": true})
+}
+
+
+// isAwaitingDeposit reports whether an address is a Linq deposit account that
+// is still expecting payment.
+//
+// This service's own orders are checked first because that is a local query.
+// Orders created through the Linq backend — everything from the consumer app —
+// are invisible here, so the backend is asked about anything unrecognised.
+//
+// A lookup failure is returned as an error rather than as "not ours". Treating
+// an unreachable backend as a definite no would quietly stop sponsoring every
+// consumer payment the moment it had a bad minute, and nobody would notice
+// except payers, who would start paying their own fees again.
+func (s *Server) isAwaitingDeposit(address string) (bool, error) {
+	var count int64
+	if err := s.DB.Model(&store.Order{}).
+		Where("deposit_address = ? AND status = ?", address, store.StateAwaitingDeposit).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return true, nil
+	}
+
+	if s.DepositLookup == nil {
+		return false, nil
+	}
+	known, err := s.DepositLookup.LookupDepositAddress(address)
+	if err != nil {
+		return false, err
+	}
+	return known.Known && known.AwaitingDeposit, nil
 }
