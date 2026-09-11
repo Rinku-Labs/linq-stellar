@@ -4,12 +4,13 @@ import "gorm.io/gorm"
 
 // Migrate creates or updates the schema this service owns.
 //
-// Three tables: the settlement orders themselves, the transitions each one
-// made, and the Horizon stream cursors that make reconnects safe. Nothing else
-// — this service does not own merchant records or bank details beyond what it
-// needs to settle one payment.
+// Four tables: the settlement orders themselves, the transitions each one
+// made, the Horizon stream cursors that make reconnects safe, and the pool of
+// deposit accounts provisioned ahead of the orders that will use them. Nothing
+// else — this service does not own merchant records or bank details beyond what
+// it needs to settle one payment.
 func Migrate(db *gorm.DB) error {
-	if err := db.AutoMigrate(&Order{}, &StatusEvent{}, &StreamCursor{}); err != nil {
+	if err := db.AutoMigrate(&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{}); err != nil {
 		return err
 	}
 	return createWorkerIndexes(db)
@@ -44,6 +45,14 @@ func createWorkerIndexes(db *gorm.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_orders_reclaim_pending
 		   ON stellar_orders (updated_at)
 		   WHERE status = 'expired' AND reserves_reclaimed = false`,
+
+		// Pool claim: the next ready account, oldest first. This one runs
+		// inside order creation, where it is the difference between handing a
+		// payer an address in milliseconds and provisioning one while they
+		// wait.
+		`CREATE INDEX IF NOT EXISTS idx_pool_ready
+		   ON stellar_deposit_pool (id)
+		   WHERE claimed_at IS NULL AND ready = true`,
 	}
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {

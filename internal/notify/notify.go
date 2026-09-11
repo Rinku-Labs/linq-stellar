@@ -33,8 +33,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 )
 
 const (
@@ -84,6 +84,29 @@ type Event struct {
 	TxHash    string  `json:"txHash,omitempty"`
 	Underpaid bool    `json:"underpaid,omitempty"`
 	Shortfall float64 `json:"shortfallNgn,omitempty"`
+
+	// What the order was struck at, alongside what actually moved. The
+	// receiving side writes emails from this payload, and "you invoiced
+	// ₦10,000 and were paid ₦9,940" is a sentence it cannot form from the
+	// running amounts alone.
+	QuotedNGN float64 `json:"quotedNgn,omitempty"`
+	QuotedUSD float64 `json:"quotedStableCoin,omitempty"`
+
+	// Where the money went, per leg. A merchant asking "did it arrive?" is
+	// asking for PayoutReference; a payer asking "where is my refund?" is
+	// asking for RefundTxHash. Sending the status without them means both
+	// questions come back as support tickets.
+	PayoutReference string `json:"payoutReference,omitempty"`
+	PayoutProvider  string `json:"payoutProvider,omitempty"`
+	RefundTxHash    string `json:"refundTxHash,omitempty"`
+	SweepTxHash     string `json:"sweepTxHash,omitempty"`
+
+	// DepositAddress is the account the payer sent to; RefundDestination is
+	// where a refund is going, which is the payer's own account unless they
+	// named another.
+	DepositAddress    string `json:"depositAddress,omitempty"`
+	RefundDestination string `json:"refundDestination,omitempty"`
+
 	// Reason carries why, for the states where "why" is the message — a
 	// payout rejected by the provider, say. The receiving side shows it to
 	// the merchant rather than making them ask.
@@ -113,7 +136,11 @@ type Worker struct {
 	Interval time.Duration
 	Batch    int
 
-	idle pace.Backoff
+	// Bus ends a wait the moment a transition is recorded. Without it a
+	// merchant's "your payout failed" waited out whatever interval this loop
+	// had drifted to while the service was quiet — a minute and a quarter, in
+	// the run that prompted this.
+	Bus *wake.Bus
 }
 
 // Run delivers pending notifications until the context is cancelled.
@@ -129,20 +156,16 @@ func (w *Worker) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	w.Log.Info("merchant notifier started", "interval", interval, "url", w.URL)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
-
-	for {
-		w.idle.Next(w.sweep(ctx), t, interval)
-		select {
-		case <-ctx.Done():
-			w.Log.Info("merchant notifier stopped")
-			return
-		case <-t.C:
-		}
-	}
+	wake.Loop{
+		Name:     "merchant notifier",
+		Topic:    wake.Notify,
+		Interval: interval,
+		Bus:      w.Bus,
+		Log:      w.Log,
+		Fields:   []any{"url", w.URL},
+		Work:     w.sweep,
+	}.Run(ctx)
 }
 
 func (w *Worker) sweep(ctx context.Context) (found bool) {
@@ -208,18 +231,33 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		return
 	}
 
+	refundTo := order.RefundAddress
+	if refundTo == "" {
+		// What the chain worker will actually use: the account the payer sent
+		// from, which is the only destination known to hold a USDC trustline.
+		refundTo = order.DepositFrom
+	}
+
 	event := Event{
-		Event:     "order." + status,
-		OrderID:   ev.OrderID,
-		Status:    status,
-		AmountNGN: order.AmountNGN,
-		AmountUSD: order.AmountUSDC,
-		TxHash:    order.DepositTxHash,
-		Underpaid: order.Underpaid,
-		Shortfall: order.ShortfallNGN,
-		Reason:    ev.Reason,
-		OccurredAt: ev.At.Format(time.RFC3339),
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Event:             "order." + status,
+		OrderID:           ev.OrderID,
+		Status:            status,
+		AmountNGN:         order.AmountNGN,
+		AmountUSD:         order.AmountUSDC,
+		TxHash:            order.DepositTxHash,
+		Underpaid:         order.Underpaid,
+		Shortfall:         order.ShortfallNGN,
+		QuotedNGN:         order.QuotedNGN,
+		QuotedUSD:         order.QuotedUSDC,
+		PayoutReference:   order.PayoutReference,
+		PayoutProvider:    order.PayoutProvider,
+		RefundTxHash:      order.RefundTxHash,
+		SweepTxHash:       order.SweepTxHash,
+		DepositAddress:    order.DepositAddress,
+		RefundDestination: refundTo,
+		Reason:            ev.Reason,
+		OccurredAt:        ev.At.Format(time.RFC3339),
+		Timestamp:         time.Now().UTC().Format(time.RFC3339),
 	}
 
 	body, err := json.Marshal(event)

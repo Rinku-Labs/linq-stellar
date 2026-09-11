@@ -32,6 +32,13 @@ type Config struct {
 	ScanInterval  time.Duration
 	DepositWindow time.Duration
 	MaxStreams    int
+	// AccountPoolSize is how many provisioned deposit accounts to keep ready
+	// for incoming orders. Zero disables the pool, returning order creation to
+	// provisioning inline — and to making the payer wait a ledger for it. Each
+	// idle account holds about one XLM of sponsor reserves, all of it returned
+	// when the account is merged back after settlement, so the standing cost is
+	// a float rather than a spend.
+	AccountPoolSize int
 
 	LinqAPIURL    string
 	LinqAPISecret string
@@ -98,6 +105,7 @@ func Load() (Config, error) {
 		ChallengeTimeout:  duration("SEP10_CHALLENGE_TIMEOUT", 5*time.Minute),
 		BaseFee:           integer("STELLAR_BASE_FEE", 0),
 		MaxStreams:        int(integer("STELLAR_MAX_STREAMS", 200)),
+		AccountPoolSize:   int(integer("STELLAR_ACCOUNT_POOL", 10)),
 	}
 
 	var problems []string

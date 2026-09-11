@@ -2,6 +2,7 @@ package stellar
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -149,9 +150,22 @@ func (c *Client) submit(sponsorAccount txnbuild.Account, ops []txnbuild.Operatio
 	if err != nil {
 		return "", fmt.Errorf("stellar: sign %s transaction: %w", label, err)
 	}
+
+	// Timed, because this is where the seconds are. A submission blocks until
+	// the transaction makes it into a closed ledger, so "the sweep took six
+	// seconds" is almost always Stellar rather than anything here — and that is
+	// only visible if the wait is measured where it happens.
+	started := time.Now()
 	resp, err := c.horizon.SubmitTransaction(tx)
 	if err != nil {
+		c.call("submit:"+label, orderKp.Address(), started, describeHorizonError(err),
+			"ops", len(ops))
 		return "", fmt.Errorf("stellar: submit %s transaction: %w", label, describeHorizonError(err))
 	}
+	c.log.Info("horizon transaction submitted",
+		"component", "horizon", "op", "submit:"+label,
+		"account", orderKp.Address(), "ops", len(ops),
+		"tx", resp.Hash, "ledger", resp.Ledger,
+		"elapsed_ms", time.Since(started).Milliseconds())
 	return resp.Hash, nil
 }

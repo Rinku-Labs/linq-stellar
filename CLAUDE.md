@@ -47,6 +47,64 @@ Orders predating the quote columns carry their quote in `AmountUSDC`/
 `AmountNGN`; `Deposits.Record` falls back to those, so don't remove that path
 while old rows exist.
 
+## Workers are signalled, not just polled
+
+Every loop is driven from the order table — select the rows in your state, work
+them, sleep — and an idle loop widens its interval (`internal/pace`) so a quiet
+service is not billed for asking an empty table. That backoff used to be the
+service's latency: a deposit detected in one second waited 76 more for the
+payout worker's next pass, and the merchant heard about it 62 seconds after
+that.
+
+So `internal/wake` makes the sleep interruptible. A worker that creates work for
+another signals its topic; the waiting worker returns at once and resets to its
+base interval. Signals cross processes over Postgres `LISTEN`/`NOTIFY`, because
+the API server and the worker are separate deployments.
+
+- **`waker` in `cmd/worker/main.go` is the whole hand-off.** It maps the state an
+  order just entered to the loop that owns what comes next. Adding a state with
+  its own queue means adding it there, or that queue is worked at its polling
+  interval.
+- The hook is `store.OnTransition`, called from `recordTransition` — the one
+  funnel every claim already goes through. Signal **after** the row is written;
+  a worker woken first finds nothing and goes back to sleep.
+- **A retry is deliberately not signalled.** The interval between payout
+  attempts is the only thing stopping a provider's bad minute from consuming all
+  three of an order's attempts inside one second.
+- Signals carry no payload: "look again", never "here is the order". A lost
+  signal costs a delay, not a settlement — the polling sweep is still the
+  guarantee.
+
+## Deposit accounts are provisioned ahead of the order
+
+Provisioning is four operations and a ledger close, five to eight seconds, and
+none of it depends on the order that waits for it. `internal/pool` keeps
+`STELLAR_ACCOUNT_POOL` accounts ready and `POST /orders` claims one, which is
+why creating an order is now a database round-trip.
+
+- The pool is a buffer, never a dependency. Empty means provision inline and be
+  slow; it must never mean refuse.
+- `ClaimPoolAccount` is a compare-and-swap for the same reason `ClaimStatus` is:
+  one address handed to two orders settles one payer's deposit against the
+  other's invoice.
+- Rows are written **before** the transaction is submitted. The seed is the only
+  way back to an account the sponsor has paid reserves for, and a crash between
+  submitting and recording would strand it. `Ready` is what makes a row usable,
+  and the keeper resolves unconfirmed rows by asking Horizon whether the account
+  actually exists.
+
+## Logs name their source
+
+Each loop gets `log.With("component", ...)` at the composition root, and every
+Horizon call logs under `component=horizon` with its op, account and elapsed
+time (`Client.call`). Five loops interleaved in one stream, with no field saying
+which is which, means "why was this slow" has to be answered by recognising
+message wording.
+
+Successful Horizon reads are debug — the scanner makes one per waiting order per
+pass. Submissions and observed payments are info, because they are where the
+seconds and the money are.
+
 ## Verify
 
 ```bash

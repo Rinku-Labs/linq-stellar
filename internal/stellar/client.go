@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -163,3 +164,36 @@ func (c *Client) NetworkPassphrase() string { return c.passphrase }
 // Horizon returns the underlying client, for callers that need account reads
 // this package does not wrap — SEP-10 signer lookups, in particular.
 func (c *Client) Horizon() *horizonclient.Client { return c.horizon }
+
+// call records one Horizon request.
+//
+// Every remote call this service makes goes to Horizon, and until these lines
+// existed none of them said so. A settlement log is five loops interleaved, and
+// working out from it whether an order was slow because Horizon was slow — or
+// because nobody had asked Horizon yet — meant inferring the request from the
+// message around it. Now each one names itself, what it was about, and how long
+// it took.
+//
+// Successful reads are logged at debug: the scanner makes one per waiting order
+// per pass, and at info they would drown the lines that matter. Failures are
+// always logged, with Horizon's result codes rather than "transaction failed",
+// because those codes are the whole of the explanation.
+func (c *Client) call(op, account string, started time.Time, err error, extra ...any) {
+	fields := append([]any{
+		"component", "horizon",
+		"op", op,
+		"account", account,
+		"elapsed_ms", time.Since(started).Milliseconds(),
+	}, extra...)
+
+	if err != nil {
+		c.log.Warn("horizon call failed", append(fields, "error", err)...)
+		return
+	}
+	c.log.Debug("horizon call", fields...)
+}
+
+// Endpoint is the Horizon this client talks to. Exposed so a deployment can log
+// the resolved URL rather than the setting, which is empty on every default
+// install.
+func (c *Client) Endpoint() string { return c.horizon.HorizonURL }

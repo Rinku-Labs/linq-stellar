@@ -21,6 +21,7 @@ import (
 	"github.com/Rinku-Labs/linq-stellar/internal/sep"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 )
 
 func main() {
@@ -73,6 +74,12 @@ func run() error {
 		return err
 	}
 
+	// Signals only travel outwards from here: this process makes work for the
+	// worker — an order to watch, a pooled account to replace — and never waits
+	// on any itself, so it publishes over Postgres and does not listen.
+	bus := wake.New()
+	bus.Bridge(wake.Notifier{DB: db, Log: log}.Notify)
+
 	srv := &api.Server{
 		DB:            db,
 		Chain:         chain,
@@ -80,7 +87,8 @@ func run() error {
 		HomeDomain:    cfg.HomeDomain,
 		DepositWindow: cfg.DepositWindow,
 		OrdersAPIKey:  cfg.OrdersAPIKey,
-		Log:           log,
+		Log:           log.With("component", "api"),
+		Wake:          bus,
 	}
 
 	// SEP-7 signing is optional. Without a key the URIs are still valid; wallets

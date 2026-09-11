@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/Rinku-Labs/linq-stellar/internal/pace"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/Rinku-Labs/linq-stellar/internal/wake"
 	"gorm.io/gorm"
 )
 
@@ -32,7 +32,10 @@ type ChainWorker struct {
 	Interval time.Duration
 	Batch    int
 
-	idle pace.Backoff
+	// Bus ends a wait when a sweep or a refund is queued, so a payer whose
+	// payout failed gets their USDC back in the same minute rather than
+	// whenever this loop next came round.
+	Bus *wake.Bus
 }
 
 // Run works the chain queues until the context is cancelled.
@@ -41,30 +44,29 @@ func (w *ChainWorker) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = defaultChainInterval
 	}
-	w.Log.Info("chain worker started", "interval", interval, "treasury", w.Treasury)
 
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	wake.Loop{
+		Name:     "chain worker",
+		Topic:    wake.Chain,
+		Interval: interval,
+		Bus:      w.Bus,
+		Log:      w.Log,
+		Fields:   []any{"treasury", w.Treasury},
+		Work:     w.pass,
+	}.Run(ctx)
+}
 
-	for {
-		worked := w.each(ctx, store.StateSweepQueued, nil, w.sweep)
-		worked = w.each(ctx, store.StateRefundQueued, nil, w.refund) || worked
-		// Expired is a terminal state, so this query would never drain without
-		// the reserves_reclaimed filter — every expired order would be
-		// re-selected on every pass for the life of the service.
-		worked = w.each(ctx, store.StateExpired, func(q *gorm.DB) *gorm.DB {
-			return q.Where("reserves_reclaimed = ?", false)
-		}, w.reclaim) || worked
-
-		w.idle.Next(worked, t, interval)
-
-		select {
-		case <-ctx.Done():
-			w.Log.Info("chain worker stopped")
-			return
-		case <-t.C:
-		}
-	}
+// pass works all three chain queues once.
+func (w *ChainWorker) pass(ctx context.Context) bool {
+	worked := w.each(ctx, store.StateSweepQueued, nil, w.sweep)
+	worked = w.each(ctx, store.StateRefundQueued, nil, w.refund) || worked
+	// Expired is a terminal state, so this query would never drain without
+	// the reserves_reclaimed filter — every expired order would be
+	// re-selected on every pass for the life of the service.
+	worked = w.each(ctx, store.StateExpired, func(q *gorm.DB) *gorm.DB {
+		return q.Where("reserves_reclaimed = ?", false)
+	}, w.reclaim) || worked
+	return worked
 }
 
 // each runs fn over a batch of orders in one state, and reports whether it
