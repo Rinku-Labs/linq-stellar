@@ -93,6 +93,27 @@ why creating an order is now a database round-trip.
   and the keeper resolves unconfirmed rows by asking Horizon whether the account
   actually exists.
 
+## One sponsor account, one sequence number
+
+Provisioning, sweeping, refunding and reclaiming are all sourced from the
+sponsor, and a Stellar account has a single sequence number. Two transactions
+built from the same reading of it are not both valid — the second comes back
+`tx_bad_seq`, having done nothing.
+
+**`Client.submitSponsored` is the only place that submits one of these.** It
+serialises them within the process and retries on a stale sequence, reloading
+the account each attempt. Building and submitting a sponsor-sourced transaction
+anywhere else reintroduces the race, and the moment it bites is the worst one:
+an empty pool means an order provisioning inline at the same instant the keeper
+is minting a batch, in a different deployment.
+
+`tx_bad_seq` is the only code that may be retried by resending the same
+transaction. Everything else is Stellar refusing what was asked for, and for a
+sweep or a refund, resending moves money twice.
+
+Fee bumps are exempt — a fee account does not spend a sequence number — which is
+why `FeeBumpAndSubmit` submits directly.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every

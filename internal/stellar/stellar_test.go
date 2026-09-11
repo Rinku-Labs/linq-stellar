@@ -1,6 +1,7 @@
 package stellar
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -162,5 +163,18 @@ func TestFormatAmountUsesStellarPrecision(t *testing.T) {
 		if got := FormatAmount(in); got != want {
 			t.Errorf("FormatAmount(%v) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Only a stale sequence number may be retried by resubmitting the same
+// transaction. Every other rejection is Stellar refusing what was asked for,
+// and sending it again would at best waste a fee — at worst, for a sweep or a
+// refund, move money a second time.
+func TestOnlyAStaleSequenceIsRetried(t *testing.T) {
+	if isBadSequence(nil) {
+		t.Error("a nil error was read as a stale sequence")
+	}
+	if isBadSequence(errors.New("connection reset by peer")) {
+		t.Error("a transport failure was read as a stale sequence; resubmitting one of those is how a payment goes out twice")
 	}
 }

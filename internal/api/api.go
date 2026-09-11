@@ -482,6 +482,25 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	if o.SweepTxHash != "" {
 		payload["sweepTxHash"] = o.SweepTxHash
 	}
+	// The three things a finished order is actually asked about: did the naira
+	// arrive, where did the crypto go if it did not, and why. The status alone
+	// answers none of them, and the poller is the only view a payer who closed
+	// the checkout tab will ever get.
+	if o.PayoutReference != "" {
+		payload["payoutReference"] = o.PayoutReference
+	}
+	if o.RefundTxHash != "" {
+		payload["refundTxHash"] = o.RefundTxHash
+	}
+	if destination := refundDestination(o); destination != "" {
+		payload["refundDestination"] = destination
+	}
+	// The reason an order is where it is, taken from the move that put it
+	// there. It is recorded on the transition rather than the order, because an
+	// order carries one status and a history carries every explanation.
+	if reason := latestReason(s.DB, o.ID); reason != "" {
+		payload["statusReason"] = reason
+	}
 	// Only present when it happened, so a caller cannot mistake the ordinary
 	// false for "we checked and it was fine" on an order predating the check.
 	if o.Underpaid {
@@ -675,4 +694,34 @@ func (s *Server) isAwaitingDeposit(address string) (bool, error) {
 		return false, err
 	}
 	return known.Known && known.AwaitingDeposit, nil
+}
+
+// refundDestination is where this order's refund would go, or went.
+//
+// The payer's own account unless they named somewhere else — the same rule the
+// chain worker applies, repeated here so a caller is told the address that will
+// actually be used rather than only the one that was configured.
+func refundDestination(o *store.Order) string {
+	if o.RefundAddress != "" {
+		return o.RefundAddress
+	}
+	return o.DepositFrom
+}
+
+// latestReason returns the explanation attached to this order's most recent
+// transition, if it had one.
+//
+// Only transitions: a notification row names the status it reported, and its
+// reason is about a delivery attempt rather than about the order.
+func latestReason(db *gorm.DB, orderID string) string {
+	var event store.StatusEvent
+	err := db.
+		Where("order_id = ? AND kind = ?", orderID, store.KindTransition).
+		Where("reason <> ''").
+		Order("at DESC, id DESC").
+		First(&event).Error
+	if err != nil {
+		return ""
+	}
+	return event.Reason
 }

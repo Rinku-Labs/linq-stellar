@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/horizonclient"
@@ -69,6 +70,11 @@ type Client struct {
 	encKey     []byte
 	baseFee    int64
 	log        *slog.Logger
+
+	// sponsorMu serialises transactions sourced from the sponsor account. See
+	// submitSponsored: every one of them consumes the same sequence number, and
+	// two built from the same reading of it means one is thrown away.
+	sponsorMu sync.Mutex
 }
 
 // New validates the configuration and returns a ready client.
