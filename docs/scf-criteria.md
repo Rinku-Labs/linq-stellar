@@ -9,6 +9,7 @@ Where each named criterion from the Pre-Launch #1 tranche lives in this repo.
 | Matched to merchant records | `Order.BusinessID`, claimed via [`claim.go`](../internal/store/claim.go) |
 | NGN disbursement on confirmation | [`payout/worker.go`](../internal/payout/worker.go) → [`linq.go`](../internal/payout/linq.go) |
 | Failure → reprocessing and refund | [`payout/worker.go`](../internal/payout/worker.go), [`settle/workers.go`](../internal/settle/workers.go) |
+| Merchant told what happened | [`notify/notify.go`](../internal/notify/notify.go) — outbox worker pushing signed status webhooks to the Linq backend |
 | Zero fees deducted from user wallet | `Order.FeeUSDC`, fixed at 0 in [`api.go`](../internal/api/api.go) |
 | SEP-7 generator | [`sep/sep7.go`](../internal/sep/sep7.go) — with request signing |
 | SEP-10 handler | [`sep/sep10.go`](../internal/sep/sep10.go) |

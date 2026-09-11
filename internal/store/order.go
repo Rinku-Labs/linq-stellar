@@ -130,6 +130,26 @@ type Order struct {
 	SweepAttempts  int  `gorm:"default:0" json:"sweepAttempts"`
 	RefundAttempts int  `gorm:"default:0" json:"refundAttempts"`
 
+	// --- Merchant notification ---
+	//
+	// This service owns its own settlement, so nothing downstream finds out an
+	// order moved unless this service says so. These three columns are the
+	// outbox that makes saying so survive a crash: the notifier looks for
+	// orders whose Status has outrun NotifiedStatus and delivers the
+	// difference. Storing the delivered state rather than a "notified" flag is
+	// what lets one order report each of its states in turn.
+
+	// NotifiedStatus is the last Status successfully delivered downstream.
+	// Empty means nothing has been delivered for this order yet.
+	NotifiedStatus string `gorm:"index" json:"notifiedStatus"`
+	// NotifyAttempts counts consecutive failed deliveries of the current
+	// Status. Reset to zero on success.
+	NotifyAttempts int `gorm:"default:0" json:"notifyAttempts"`
+	// NotifyAfter holds off the next delivery attempt after a failure, so a
+	// receiver that is down or rejecting is retried on a widening interval
+	// rather than hammered every pass. Zero means eligible now.
+	NotifyAfter *time.Time `gorm:"index" json:"notifyAfter,omitempty"`
+
 	// --- Timestamps ---
 	//
 	// Real timestamps, not strings. The main backend stores these as TEXT in

@@ -48,6 +48,14 @@ type Config struct {
 	SEP10JWTSecret   []byte
 	ChallengeTimeout time.Duration
 
+	// MerchantWebhookURL is the Linq backend endpoint told about order status
+	// changes. Empty disables notification: the service still settles, but
+	// nothing downstream hears about it, which is only right for a local run.
+	MerchantWebhookURL string
+	// MerchantWebhookSecret signs those deliveries (HMAC-SHA256, hex, sent as
+	// x-linq-signature). Must match the secret the backend verifies with.
+	MerchantWebhookSecret string
+
 	OrgName        string
 	OrgURL         string
 	OrgDescription string
@@ -73,6 +81,10 @@ func Load() (Config, error) {
 		LinqAPIURL:        os.Getenv("LINQ_API_URL"),
 		LinqAPISecret:     os.Getenv("LINQ_INTERNAL_SECRET"),
 		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
+
+		MerchantWebhookURL:    os.Getenv("MERCHANT_WEBHOOK_URL"),
+		MerchantWebhookSecret: os.Getenv("MERCHANT_WEBHOOK_SECRET"),
+
 		HomeDomain:        os.Getenv("SEP10_HOME_DOMAIN"),
 		WebAuthDomain:     env("SEP10_WEB_AUTH_DOMAIN", os.Getenv("SEP10_HOME_DOMAIN")),
 		SEP10SigningKey:   os.Getenv("SEP10_SIGNING_KEY"),
