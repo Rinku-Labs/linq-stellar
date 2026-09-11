@@ -40,6 +40,9 @@ func ClaimStatus(db *gorm.DB, orderID, from, to string) (bool, error) {
 	if res.Error != nil {
 		return false, res.Error
 	}
+	if res.RowsAffected > 0 {
+		recordTransition(db, orderID, from, to, "")
+	}
 	return res.RowsAffected > 0, nil
 }
 
@@ -66,6 +69,9 @@ func ClaimStatusWith(db *gorm.DB, orderID, from, to string, fields map[string]an
 	if res.Error != nil {
 		return false, res.Error
 	}
+	if res.RowsAffected > 0 {
+		recordTransition(db, orderID, from, to, "")
+	}
 	return res.RowsAffected > 0, nil
 }
 
@@ -76,12 +82,48 @@ func ClaimStatusWith(db *gorm.DB, orderID, from, to string, fields map[string]an
 // can find it again. It is conditional on the order still being in the state
 // this caller left it in, so a release cannot stamp on someone else's progress.
 func ReleaseStatus(db *gorm.DB, orderID, from, to string) error {
-	return db.Model(&Order{}).
+	return ReleaseStatusBecause(db, orderID, from, to, "")
+}
+
+// ReleaseStatusBecause is ReleaseStatus, recording why.
+//
+// Worth the second function: a release is almost always a retry, and a retry
+// with no reason attached leaves the history showing an order bouncing between
+// two states for reasons nobody can reconstruct later.
+func ReleaseStatusBecause(db *gorm.DB, orderID, from, to, reason string) error {
+	res := db.Model(&Order{}).
 		Where("id = ? AND status = ?", orderID, from).
 		Updates(map[string]any{
 			"status":     to,
 			"updated_at": time.Now().UTC(),
-		}).Error
+		})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		recordTransition(db, orderID, from, to, reason)
+	}
+	return nil
+}
+
+// ClaimStatusBecause is ClaimStatus, recording why.
+func ClaimStatusBecause(db *gorm.DB, orderID, from, to, reason string) (bool, error) {
+	if !CanTransition(from, to) {
+		return false, nil
+	}
+	res := db.Model(&Order{}).
+		Where("id = ? AND status = ?", orderID, from).
+		Updates(map[string]any{
+			"status":     to,
+			"updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected > 0 {
+		recordTransition(db, orderID, from, to, reason)
+	}
+	return res.RowsAffected > 0, nil
 }
 
 // ClaimFinancialOutcome records, exactly once, whether an order was disbursed

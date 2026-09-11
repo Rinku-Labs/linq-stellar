@@ -205,8 +205,8 @@ func (w *Worker) retryOrRefund(order *store.Order, reason string) {
 	if attempts < maxAttempts {
 		w.Log.Warn("payout failed, will retry",
 			"order", order.ID, "attempt", attempts, "reason", reason)
-		if err := store.ReleaseStatus(w.DB, order.ID,
-			store.StatePayoutProcessing, store.StatePayoutQueued); err != nil {
+		if err := store.ReleaseStatusBecause(w.DB, order.ID,
+			store.StatePayoutProcessing, store.StatePayoutQueued, reason); err != nil {
 			w.Log.Error("could not requeue payout", "order", order.ID, "error", err)
 		}
 		return
@@ -214,8 +214,8 @@ func (w *Worker) retryOrRefund(order *store.Order, reason string) {
 
 	w.Log.Error("payout failed permanently, refunding",
 		"order", order.ID, "attempts", attempts, "reason", reason)
-	if _, err := store.ClaimStatus(w.DB, order.ID,
-		store.StatePayoutProcessing, store.StateRefundQueued); err != nil {
+	if _, err := store.ClaimStatusBecause(w.DB, order.ID,
+		store.StatePayoutProcessing, store.StateRefundQueued, reason); err != nil {
 		w.Log.Error("could not queue refund", "order", order.ID, "error", err)
 	}
 }

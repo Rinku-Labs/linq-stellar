@@ -403,6 +403,19 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 		}
 	}
 
+	// Every transition this order made, with timestamps. Served from the API
+	// rather than left in container logs because the interesting questions —
+	// how long a retry took, how quickly a failure reached a refund — are
+	// questions about elapsed time between two moves, and a reviewer holding
+	// an order id should be able to answer them without access to our logs.
+	if events, err := store.StatusHistory(s.DB, o.ID); err != nil {
+		s.Log.Warn("could not load status history", "order", o.ID, "error", err)
+	} else if len(events) > 0 {
+		payload["statusHistory"] = events
+		first, last := events[0].At, events[len(events)-1].At
+		payload["statusHistorySeconds"] = last.Sub(first).Seconds()
+	}
+
 	writeJSON(w, status, payload)
 }
 
