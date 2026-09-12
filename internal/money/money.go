@@ -26,21 +26,31 @@ const (
 
 	// QuoteDecimals is the precision a quote is published at.
 	//
-	// One digit tighter than the network allows, deliberately. A quote is shown
-	// on a screen, encoded in a SEP-7 URI, and typed by hand into wallets that
-	// carry six decimals for USDC on other chains. Quoting at six means all
-	// three agree on the same number exactly, and every quote we publish is
-	// representable on every rail a payer might use. The seventh decimal is
-	// worth a hundred-thousandth of a naira; the disagreement it would buy is
-	// worth more.
-	QuoteDecimals = 6
+	// Two, rounded up. A payer is asked for a figure they can read and type —
+	// 0.08 rather than 0.073302 — and because QuoteUSDC rounds up, that figure
+	// is never less than what the invoice needs.
+	//
+	// The cost is borne by the payer, not the merchant: they send at most 0.01
+	// USDC more than the strict conversion, roughly ₦14 at current rates, which
+	// on a very small order is a noticeable share of it. That was a deliberate
+	// trade for legibility. What must never come back is two decimals rounded
+	// to *nearest*: that told a payer to send 0.07 against a 0.0733 invoice and
+	// paid a merchant ₦95.49 for ₦100.
+	//
+	// Every surface quotes this same figure — the screen, the SEP-7 URI and the
+	// Linq backend's own ceil(amountNGN/rate*100)/100 — so they agree exactly.
+	QuoteDecimals = 2
 
 	// NairaDecimals is kobo. Bank rails settle in kobo, so an NGN figure that
 	// carries more precision than this is a number no payout can actually pay.
 	NairaDecimals = 2
 
-	// DustUSDC is the largest shortfall treated as an exact payment: one unit
-	// at quote precision, worth roughly ₦0.0014.
+	// DustUSDC is the largest shortfall treated as an exact payment, worth
+	// roughly ₦0.0014.
+	//
+	// Deliberately NOT one unit at quote precision, which is now 0.01. A
+	// tolerance that wide would read a 0.07 deposit against a 0.08 quote as
+	// paid in full — the underpayment this package exists to catch.
 	//
 	// It absorbs a wallet that dropped the last digit, and nothing more. A
 	// wider tolerance would be Linq quietly covering the gap between what a

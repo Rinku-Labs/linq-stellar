@@ -14,17 +14,25 @@ order.
 **`internal/money` is the only place rounding rules live.** Do not inline
 `math.Round`, `math.Ceil` or `* 100` arithmetic on an amount anywhere else.
 
-- `money.QuoteUSDC` rounds **up**, at `QuoteDecimals` (6). Six rather than
-  Stellar's seven so the same figure is exact on screen, in the SEP-7 URI, and
-  in wallets carrying six decimals for USDC on other chains.
+- `money.QuoteUSDC` rounds **up**, at `QuoteDecimals` (**2**). Two so a payer
+  reads and types 0.08 rather than 0.073302. Up so that figure is never less
+  than the invoice needs. The payer absorbs the rounding — at most 0.01 USDC,
+  about ₦14 — never the merchant. That trade was chosen deliberately.
 - `money.RoundNGN` is kobo. Bank rails cannot pay a fraction of a kobo.
-- Never round a quote to "nearest" or to two decimals. Two decimals is a naira
-  habit; at these rates the third decimal is worth ₦1.36.
+- **Never round a quote to nearest, and never down.** Two decimals to nearest
+  is the original bug: 0.0733 became 0.07 and a merchant was paid ₦95.49 for
+  ₦100. Two decimals *up* is correct; two decimals any other way is not.
+- `DustUSDC` stays at 1e-6 and is **not** tied to `QuoteDecimals`. Widening it
+  to 0.01 would accept a 0.07 deposit against a 0.08 quote as payment in full.
+- Every surface must quote the same figure: the screen, the SEP-7 URI, and the
+  Linq backend's `ceil(amountNGN/rate*100)/100`. Change `QuoteDecimals` without
+  changing the others and a QR will prefill a different amount than the screen
+  shows.
 - Scaling comes before rounding, never after.
 
 `ceilTo` snaps values already exact at the target precision before rounding —
-`0.07 * 1e6` is `70000.00000000001` in float64, and a bare `Ceil` turns an
-exact 0.07 into 0.070001.
+`0.57 * 100` is `57.00000000000001` in float64, and a bare `Ceil` turns an
+exact 0.57 into 0.58.
 
 ## The order's quote is immutable
 
