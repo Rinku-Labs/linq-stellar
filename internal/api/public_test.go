@@ -406,9 +406,13 @@ func TestV1OrderMatchesTheLegacyResponse(t *testing.T) {
 		}
 	}
 	for name := range v1 {
-		if _, ok := legacy[name]; !ok {
+		// payoutAttempts is /v1 only (SD-4); the legacy body stays as it was.
+		if _, ok := legacy[name]; !ok && name != "payoutAttempts" {
 			t.Errorf("/v1 adds %q", name)
 		}
+	}
+	if _, ok := legacy["payoutAttempts"]; ok {
+		t.Errorf("the legacy response gained payoutAttempts")
 	}
 }
 
@@ -805,4 +809,66 @@ func TestTheLegacyRoutesCarryNoRateLimit(t *testing.T) {
 // legacyOrderBody is what Linq-B2B sends: it fetches the rate and passes it on.
 func legacyOrderBody(idempotencyKey string) string {
 	return fmt.Sprintf(`{"idempotencyKey":%q,"amountNgn":10000,"rate":1655,"bankCode":"033","bankAccount":"1234567890"}`, idempotencyKey)
+}
+
+// --- SD-4: payout attempts and induced failures ---
+
+func TestV1ListsEveryPayoutReference(t *testing.T) {
+	p := newPublicAPI(t)
+	integrator := p.integrator(t, "A")
+	_, key := p.issue(t, integrator)
+	p.db.Create(&store.Order{ID: "ord_1", IdempotencyKey: "k", IntegratorID: integrator, Status: store.StatePayoutQueued})
+	if _, err := store.RecordInducedFailure(p.db, "ord_1", 1, "ord_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPayoutAttempt(p.db, "ord_1", 2, "ord_1-p2"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := decode(t, p.asKey(key, http.MethodGet, "/v1/orders/ord_1", ""))
+	attempts, _ := body["payoutAttempts"].([]any)
+	if len(attempts) != 2 {
+		t.Fatalf("payoutAttempts = %v, want two", body["payoutAttempts"])
+	}
+	first, second := attempts[0].(map[string]any), attempts[1].(map[string]any)
+	if first["reference"] != "ord_1" || first["outcome"] != "failed" || first["induced"] != true ||
+		second["reference"] != "ord_1-p2" || second["outcome"] != "pending" || second["induced"] != false {
+		t.Errorf("payoutAttempts = %v", attempts)
+	}
+	if _, ok := first["reason"]; ok {
+		t.Errorf("an attempt's internal reason was served: %v", first)
+	}
+}
+
+func TestInducingAPayoutFailureNeedsTheIntegratorFlag(t *testing.T) {
+	p := newPublicAPI(t)
+	integrator := p.integrator(t, "Linq test")
+	p.db.Create(&store.Order{ID: "ord_1", IdempotencyKey: "k", IntegratorID: integrator, Status: store.StateAwaitingDeposit})
+	path := "/admin/orders/ord_1/induce-payout-failure"
+
+	if w := p.asAdmin(http.MethodPost, path, `{"kind":"terminal"}`); w.Code != http.StatusForbidden {
+		t.Errorf("without the flag: %d %s, want 403", w.Code, w.Body.String())
+	}
+
+	p.db.Model(&store.Integrator{}).Where("id = ?", integrator).Update("allow_failure_injection", true)
+	if w := p.asAdmin(http.MethodPost, path, `{"kind":"sometimes"}`); w.Code != http.StatusBadRequest {
+		t.Errorf("bad kind: %d, want 400", w.Code)
+	}
+	if w := p.asAdmin(http.MethodPost, "/admin/orders/nope/induce-payout-failure", `{"kind":"terminal"}`); w.Code != http.StatusNotFound {
+		t.Errorf("unknown order: %d, want 404", w.Code)
+	}
+	if w := p.asAdmin(http.MethodPost, path, `{"kind":"terminal"}`); w.Code != http.StatusOK {
+		t.Errorf("with the flag: %d %s, want 200", w.Code, w.Body.String())
+	}
+	if w := p.asAdmin(http.MethodPost, path, `{"kind":"transient"}`); w.Code != http.StatusConflict {
+		t.Errorf("second time: %d, want 409", w.Code)
+	}
+	if w := p.send(http.MethodPost, path, `{"kind":"terminal"}`, nil); w.Code == http.StatusOK {
+		t.Errorf("without the admin key: %d, want a refusal", w.Code)
+	}
+
+	kind, err := store.InducedFailureOf(p.db, "ord_1")
+	if err != nil || kind != store.InducedTerminal {
+		t.Errorf("induced failure = %q, %v; want terminal", kind, err)
+	}
 }

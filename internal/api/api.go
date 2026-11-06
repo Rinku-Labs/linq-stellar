@@ -495,7 +495,20 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
-	s.writeOrder(w, http.StatusOK, &order)
+	if callerOf(r).keyID == "" { // the legacy shared key
+		s.writeOrder(w, http.StatusOK, &order)
+		return
+	}
+	// /v1 also lists every payout reference used, so an integrator can see a
+	// retry was a new payout. The legacy route's body stays as it was.
+	attempts, err := store.PayoutAttempts(s.DB, order.ID)
+	if err != nil {
+		s.Log.Warn("could not load payout attempts", "order", order.ID, "error", err)
+	}
+	if attempts == nil {
+		attempts = []store.PayoutAttempt{}
+	}
+	s.writeOrderWith(w, http.StatusOK, &order, map[string]any{"payoutAttempts": attempts})
 }
 
 // writeOrder renders an order along with the SEP-7 URI a wallet can scan.
@@ -505,6 +518,11 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 // would be reconstructing facts it had to be told, and would be the second
 // place a wrong asset issuer could creep in.
 func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
+	s.writeOrderWith(w, status, o, nil)
+}
+
+// writeOrderWith is writeOrder with extra fields added to the body.
+func (s *Server) writeOrderWith(w http.ResponseWriter, status int, o *store.Order, extra map[string]any) {
 	payload := map[string]any{
 		"id":             o.ID,
 		"status":         o.Status,
@@ -580,6 +598,9 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 		}
 	}
 
+	for k, v := range extra {
+		payload[k] = v
+	}
 	writeJSON(w, status, payload)
 }
 
