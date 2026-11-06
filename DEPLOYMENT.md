@@ -132,6 +132,31 @@ curl -X POST $HOST/admin/reconciliation/items/$ITEM_ID/resolve -H "X-Admin-Key: 
 With more than one worker instance, each runs its own cycles. That is safe,
 since the cycles only read, but it records each check twice.
 
+### Reconciliation page (`server` only, optional)
+
+`/reconciliation` shows a reviewer what the worker recorded: every cycle with
+its counts, each cycle's checks (filterable to mismatches) with their
+resolutions, every mismatch in one list, and a running total of completed
+cycles. Transactions and accounts link to Stellar Expert, on testnet or public
+to match `STELLAR_NETWORK_PASSPHRASE`. It is read-only, and reads only the two
+reconciliation tables, so it has no bank detail to show.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `REVIEWER_TOKEN` | empty | The one secret that opens the page. Empty means the page is not served at all. At least 32 characters, or the server refuses to start. Generate: `openssl rand -hex 32` |
+
+Give a reviewer the address and the token. They paste the token once; the
+browser keeps a cookie made from it (not the token itself) until it closes.
+Changing `REVIEWER_TOKEN` signs every reviewer out. A script can send the token
+as a header instead:
+
+```bash
+curl $HOST/reconciliation -H "Authorization: Bearer $REVIEWER_TOKEN"
+```
+
+The page does not depend on `PUBLIC_API_ENABLED`, and the token opens nothing
+else: not `/admin`, not `/v1`, not `/orders`.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 

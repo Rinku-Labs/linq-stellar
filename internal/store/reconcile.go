@@ -211,9 +211,67 @@ func ResolvedAccounts(db *gorm.DB, check string, accounts []string) (map[string]
 
 // LatestCycles returns the most recent cycles, newest first.
 func LatestCycles(db *gorm.DB, limit int) ([]ReconciliationCycle, error) {
+	return ListCycles(db, 0, limit)
+}
+
+// ListCycles returns up to limit cycles older than before, newest first. A
+// before of zero starts from the newest.
+func ListCycles(db *gorm.DB, before int64, limit int) ([]ReconciliationCycle, error) {
+	q := db.Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit)
+	if before > 0 {
+		q = q.Where("id < ?", before)
+	}
 	var cycles []ReconciliationCycle
-	err := db.Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit).Find(&cycles).Error
+	err := q.Find(&cycles).Error
 	return cycles, err
+}
+
+// ErrCycleNotFound means there is no reconciliation cycle with that ID.
+var ErrCycleNotFound = errors.New("store: reconciliation cycle not found")
+
+// GetCycle returns one cycle.
+func GetCycle(db *gorm.DB, id int64) (ReconciliationCycle, error) {
+	var cycle ReconciliationCycle
+	err := db.First(&cycle, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return cycle, ErrCycleNotFound
+	}
+	return cycle, err
+}
+
+// CycleItems returns a cycle's items in the order they were checked, or only
+// its mismatches.
+func CycleItems(db *gorm.DB, cycleID int64, mismatchesOnly bool) ([]ReconciliationItem, error) {
+	q := db.Where("cycle_id = ?", cycleID)
+	if mismatchesOnly {
+		q = q.Where("result = ?", ReconcileMismatch)
+	}
+	var items []ReconciliationItem
+	err := q.Order("id").Find(&items).Error
+	return items, err
+}
+
+// ListMismatches returns up to limit mismatch items older than before, from
+// every cycle, newest first. A before of zero starts from the newest.
+func ListMismatches(db *gorm.DB, before int64, limit int) ([]ReconciliationItem, error) {
+	q := db.Where("result = ?", ReconcileMismatch).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit)
+	if before > 0 {
+		q = q.Where("id < ?", before)
+	}
+	var items []ReconciliationItem
+	err := q.Find(&items).Error
+	return items, err
+}
+
+// MismatchCounts counts every mismatch ever recorded, and those nobody has
+// resolved yet.
+func MismatchCounts(db *gorm.DB) (total, unresolved int64, err error) {
+	if err = db.Model(&ReconciliationItem{}).Where("result = ?", ReconcileMismatch).Count(&total).Error; err != nil {
+		return 0, 0, err
+	}
+	err = db.Model(&ReconciliationItem{}).Where("result = ? AND resolved_at IS NULL", ReconcileMismatch).Count(&unresolved).Error
+	return total, unresolved, err
 }
 
 // CompletedCycles counts the cycles that ran to the end.

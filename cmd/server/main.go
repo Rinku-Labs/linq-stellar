@@ -93,8 +93,10 @@ func run() error {
 
 		PublicAPIEnabled: cfg.PublicAPIEnabled,
 		AdminAPIKey:      cfg.AdminAPIKey,
+		ReviewerToken:    cfg.ReviewerToken,
 	}
 	log.Info("public api", "enabled", cfg.PublicAPIEnabled, "adminKeySet", cfg.AdminAPIKey != "")
+	log.Info("reconciliation page", "enabled", cfg.ReviewerToken != "")
 
 	// SEP-7 signing is optional. Without a key the URIs are still valid; wallets
 	// that check simply show them as unverified.

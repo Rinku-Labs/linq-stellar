@@ -53,6 +53,9 @@ type Server struct {
 	PublicAPIEnabled bool
 	// AdminAPIKey guards /admin. Empty refuses every admin request.
 	AdminAPIKey string
+	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// page is not served at all.
+	ReviewerToken string
 	// Now is the clock for credentials and rate limits. Nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
@@ -103,6 +106,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
 
+	if s.ReviewerToken != "" {
+		s.reconciliationRoutes(mux)
+	}
 	if s.PublicAPIEnabled {
 		s.publicRoutes(mux)
 	}
