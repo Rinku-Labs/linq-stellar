@@ -3,8 +3,10 @@ package payout
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -20,7 +22,8 @@ import (
 //	  -> 200/202 {status, payoutId, provider}
 //
 //	GET  /internal/payout?reference=<id>
-//	  -> 200 {status, payoutId, provider, failureReason}
+//	  -> 200 {status, payoutId, provider, failureReason, amountNGN?}
+//	  -> 404 when no payout has that reference
 //
 // Both must be idempotent on reference. The public POST /b2b/offramp cannot
 // serve this: it mints its own deposit wallet and waits for a deposit, which is
@@ -57,7 +60,22 @@ type payoutResponse struct {
 	Provider      string `json:"provider"`
 	FailureReason string `json:"failureReason"`
 	Message       string `json:"message"`
+	// AmountNGN is optional: the Linq backend does not send it yet.
+	AmountNGN *float64 `json:"amountNGN"`
 }
+
+// ErrNotFound means the Linq backend has no payout with that reference.
+var ErrNotFound = errors.New("payout: no payout with that reference")
+
+// statusError is a reply outside 2xx, kept so Status can tell "no such
+// payout" apart from a failure to answer.
+type statusError struct {
+	code int
+	err  error
+}
+
+func (e *statusError) Error() string { return e.err.Error() }
+func (e *statusError) Unwrap() error { return e.err }
 
 // Pay submits a disbursement.
 func (l *LinqAPI) Pay(r Request) (Result, error) {
@@ -93,7 +111,11 @@ func (l *LinqAPI) Status(reference string) (Result, error) {
 		return Result{}, fmt.Errorf("payout: reference is required")
 	}
 	resp, err := l.do(http.MethodGet,
-		fmt.Sprintf("%s/internal/payout?reference=%s", l.BaseURL, reference), nil)
+		fmt.Sprintf("%s/internal/payout?reference=%s", l.BaseURL, url.QueryEscape(reference)), nil)
+	var replied *statusError
+	if errors.As(err, &replied) && replied.code == http.StatusNotFound {
+		return Result{}, fmt.Errorf("%w: %s", ErrNotFound, reference)
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -134,7 +156,8 @@ func (l *LinqAPI) do(method, url string, body []byte) (payoutResponse, error) {
 		if detail == "" {
 			detail = parsed.FailureReason
 		}
-		return payoutResponse{}, fmt.Errorf("payout: %s returned %d: %s", url, res.StatusCode, detail)
+		return payoutResponse{}, &statusError{code: res.StatusCode,
+			err: fmt.Errorf("payout: %s returned %d: %s", url, res.StatusCode, detail)}
 	}
 	return parsed, nil
 }
@@ -157,6 +180,7 @@ func toResult(r payoutResponse) Result {
 		Reference:     r.PayoutID,
 		Provider:      r.Provider,
 		FailureReason: r.FailureReason,
+		AmountNGN:     r.AmountNGN,
 	}
 }
 

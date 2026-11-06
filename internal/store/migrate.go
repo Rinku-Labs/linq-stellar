@@ -6,14 +6,16 @@ import "gorm.io/gorm"
 //
 // The settlement orders themselves, the transitions each one made, the Horizon
 // stream cursors that make reconnects safe, the pool of deposit accounts
-// provisioned ahead of the orders that will use them, and the integrators, keys
-// and rate counters behind the public API. Nothing else — this service does not
+// provisioned ahead of the orders that will use them, the integrators, keys
+// and rate counters behind the public API, and the reconciliation record of
+// those books checked against the ledger. Nothing else — this service does not
 // own merchant records or bank details beyond what it needs to settle one
 // payment.
 func Migrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(
 		&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{},
 		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{}, &WebhookDelivery{},
+		&ReconciliationCycle{}, &ReconciliationItem{},
 	); err != nil {
 		return err
 	}

@@ -183,6 +183,38 @@ lanes existed. Never regenerate it to make a test pass.
   one and the sweep falls back to reading most of the table. Adding a state to
   `notifiable` means adding it there, and replacing the index.
 
+## Reconciliation reads and records, never acts
+
+`internal/reconcile` checks the order table against Horizon and the Linq backend
+every cycle and writes each result to `reconciliation_items`. A mismatch is a
+note for a person, never a trigger. The engine is given a `Ledger` and a
+`Payouts` that can only read, and it updates no order: keep it that way. An
+engine that "fixed" a balance it had misread would move money on a bug.
+
+- **The cycle row comes first and the counts last.** `RunCycle` writes the cycle
+  before checking anything, items as they are found, and the counts and error
+  in a deferred finish, so a cycle that stops partway still says what it
+  checked and why it stopped.
+- **A passed check is final, and a resolved mismatch is not flagged again.**
+  The ledger does not change a confirmed transaction (`SettledChecks`). A
+  mismatch is checked again every cycle until someone resolves it with
+  `POST /admin/reconciliation/items/{id}/resolve`, which writes once.
+- **Look twice before recording a mismatch that could be the order moving.**
+  A deposit seen a second before the detector claims it is not a missed
+  deposit. Re-read the order and record nothing if it moved.
+- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`),
+  newest orders first. A Horizon rate-limit refusal stops the cycle's Horizon
+  checks rather than spending the rest of the budget being refused.
+- **The sponsored-account check stays behind `RECONCILE_SPONSORED_ACCOUNTS`.**
+  Pool accounts count as known. If another service opens accounts with the same
+  sponsor, every one of them would be reported.
+- **The payout check asks about the order ID**, which is what the payout worker
+  sends. When retries get their own references, it must ask about the last one.
+  The Linq backend's `GET /internal/payout` does not send an amount yet; the
+  check compares one as soon as it does.
+- **`expected` and `actual` are read by reviewers.** Never put bank details in
+  them.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every

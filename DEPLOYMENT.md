@@ -104,6 +104,34 @@ its events are closed unreported, and setting a URL later does not replay them.
 Linq-B2B's webhook stays in `MERCHANT_WEBHOOK_URL` and can't be set here. Every
 attempt, for every integrator, is a row in `webhook_deliveries`.
 
+### Reconciliation (`worker` only, all optional)
+
+The worker checks the books against the ledger every 15 minutes, starting at
+boot, and records each cycle in `reconciliation_cycles` and each check in
+`reconciliation_items`. It only reads: a mismatch is written down, never acted
+on. A cycle logs `reconciliation cycle finished` with its counts, and each
+mismatch as `reconciliation mismatch`.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `RECONCILE_INTERVAL` | `15m` | Time between cycles, at least `1m` |
+| `RECONCILE_HORIZON_CALLS` | `200` | Horizon requests one cycle may make. What it cannot reach waits for the next cycle, newest orders first. Four cycles an hour at 200 is 800 requests, well inside Horizon's 3,600 an hour |
+| `RECONCILE_PAYOUT_CALLS` | `50` | `GET /internal/payout` requests one cycle may make to the Linq backend |
+| `RECONCILE_SPONSORED_ACCOUNTS` | off | Exactly `true` turns on the check for accounts the sponsor pays reserves for with no order or pool row behind them. **Leave it off on mainnet until you know no other service uses the same sponsor account** (Linq-v2 has a `STELLAR_SPONSOR_KEY` too): every account another service opens would be reported |
+
+To record why a mismatch is not a problem, or what was done about it (needs
+`PUBLIC_API_ENABLED=true` on the server, like every `/admin` route). The check
+stops being flagged once it has a resolution, and a resolution cannot be
+rewritten:
+
+```bash
+curl -X POST $HOST/admin/reconciliation/items/$ITEM_ID/resolve -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"resolution":"Induced failure for the SD-11 demo","resolvedBy":"ify"}'
+```
+
+With more than one worker instance, each runs its own cycles. That is safe,
+since the cycles only read, but it records each check twice.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 

@@ -73,6 +73,9 @@ type Result struct {
 	Provider string
 	// FailureReason is set when Status is StatusFailed.
 	FailureReason string
+	// AmountNGN is what the provider says it paid, when it says. Nil means it
+	// did not report an amount, which is not the same as zero.
+	AmountNGN *float64
 }
 
 // Provider disburses NGN.

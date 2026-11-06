@@ -153,3 +153,43 @@ func TestConcurrentMissesShareOneFetch(t *testing.T) {
 		t.Errorf("fetches = %d, want 1", got)
 	}
 }
+
+func statusServer(t *testing.T, status int, body string) *LinqAPI {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/payout" || r.Method != http.MethodGet || r.URL.Query().Get("reference") != "ord_1" {
+			t.Errorf("request = %s %s", r.Method, r.URL.String())
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	api, err := NewLinqAPI(srv.URL, "secret")
+	if err != nil {
+		t.Fatalf("new api: %v", err)
+	}
+	return api
+}
+
+// The bodies are the shapes b2b_linq.GetInternalPayout writes.
+func TestStatusSaysWhenThereIsNoSuchPayout(t *testing.T) {
+	_, err := statusServer(t, http.StatusNotFound, `{"message":"No payout for that reference"}`).Status("ord_1")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("404: %v", err)
+	}
+	_, err = statusServer(t, http.StatusBadGateway, `{"message":"upstream"}`).Status("ord_1")
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("a failure to answer is not 'no such payout': %v", err)
+	}
+}
+
+func TestStatusReadsTheAmountWhenSent(t *testing.T) {
+	without, err := statusServer(t, http.StatusOK, `{"payoutId":"p1","status":"paid","provider":"nomba"}`).Status("ord_1")
+	if err != nil || without.Status != StatusPaid || without.AmountNGN != nil || without.Reference != "p1" {
+		t.Errorf("without an amount: %+v %v", without, err)
+	}
+	with, err := statusServer(t, http.StatusOK, `{"payoutId":"p1","status":"paid","provider":"nomba","amountNGN":10000.5}`).Status("ord_1")
+	if err != nil || with.AmountNGN == nil || *with.AmountNGN != 10000.5 {
+		t.Errorf("with an amount: %+v %v", with, err)
+	}
+}
