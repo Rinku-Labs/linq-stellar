@@ -230,8 +230,12 @@ engine that "fixed" a balance it had misread would move money on a bug.
 - **The sponsored-account check stays behind `RECONCILE_SPONSORED_ACCOUNTS`.**
   Pool accounts count as known. If another service opens accounts with the same
   sponsor, every one of them would be reported.
-- **The payout check asks about the order ID**, which is what the payout worker
-  sends. When retries get their own references, it must ask about the last one.
+- **The payout check asks about every reference an order sent**, from its
+  `stellar_payout_attempts` (`payoutRefs`): the last must be paid on a paid
+  order, and no other may be, or the merchant may have been paid twice. None may
+  be paid on a refunded order. Induced attempts never reached Linq and are not
+  asked about; an order with no attempts on record is asked about by its ID.
+  An order's references are asked about together or not at all in a cycle.
   The Linq backend's `GET /internal/payout` does not send an amount yet; the
   check compares one as soon as it does.
 - **`expected` and `actual` are read by reviewers.** Never put bank details in

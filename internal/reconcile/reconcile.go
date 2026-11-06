@@ -56,7 +56,8 @@ const (
 	// 5. Every account the sponsor pays reserves for has an order or a pool
 	// row behind it.
 	CheckSponsoredAccount = "sponsored_account"
-	// 6. The Linq backend's record of the NGN payout agrees with ours.
+	// 6. The Linq backend's record of the NGN payout agrees with ours, under
+	// every reference the order's payout attempts sent.
 	CheckPayout = "payout"
 )
 
@@ -250,12 +251,14 @@ func (r *run) spendHorizon() bool {
 	return true
 }
 
-func (r *run) spendPayout() bool {
-	if r.payoutsLeft <= 0 {
+// spendPayouts takes n calls to the payout provider from the budget, or none
+// if fewer are left: an order's payout is checked whole or not at all.
+func (r *run) spendPayouts(n int) bool {
+	if r.payoutsLeft < n {
 		r.deferred++
 		return false
 	}
-	r.payoutsLeft--
+	r.payoutsLeft -= n
 	return true
 }
 
@@ -477,7 +480,7 @@ func (r *run) checkFinished(o *store.Order, settled map[string]bool) error {
 			return err
 		}
 	}
-	if r.e.Payouts != nil && payoutDue(o) && due(CheckPayout) && r.spendPayout() {
+	if r.e.Payouts != nil && payoutDue(o) && due(CheckPayout) {
 		if err := r.checkPayout(o); err != nil {
 			return err
 		}
@@ -696,57 +699,180 @@ func (r *run) checkClosed(o *store.Order) error {
 
 // checkPayout compares the Linq backend's record of the NGN payout with ours.
 //
-// The reference is the order ID, which is what the payout worker sends. When
-// retries start using their own references (SD-4), this must ask about the
-// last one the order used.
+// It asks about every reference the payout worker sent for the order (see
+// payoutRefs). On a paid order the last one must be paid and every earlier one
+// must not be: an earlier reference that paid too is the merchant paid twice.
+// On a refunded order none may be paid or still going.
 func (r *run) checkPayout(o *store.Order) error {
-	item := store.ReconciliationItem{OrderID: o.ID, CheckName: CheckPayout}
+	attempts, err := store.PayoutAttempts(r.e.DB, o.ID)
+	if err != nil {
+		return fmt.Errorf("load payout attempts for %s: %w", o.ID, err)
+	}
+	refs, induced := payoutRefs(o.ID, attempts)
+	if !r.spendPayouts(len(refs)) {
+		return nil
+	}
 	refunded := o.FinancialOutcome == "refunded"
-	if refunded {
+	last, earlier := refs[len(refs)-1], refs[:len(refs)-1]
+
+	item := store.ReconciliationItem{OrderID: o.ID, CheckName: CheckPayout}
+	switch {
+	case refunded && len(refs) == 1:
 		item.Expected = "no NGN paid: the payout failed and the USDC was refunded"
-	} else {
+	case refunded:
+		item.Expected = fmt.Sprintf("no NGN paid under %s: the payout failed and the USDC was refunded",
+			strings.Join(refs, ", "))
+	case len(refs) == 1:
 		item.Expected = fmt.Sprintf("paid ₦%s, payout %s via %s",
 			naira(o.AmountNGN), orUnknown(o.PayoutReference), orUnknown(o.PayoutProvider))
+	default:
+		item.Expected = fmt.Sprintf("paid ₦%s under %s, payout %s via %s; nothing paid under %s",
+			naira(o.AmountNGN), last, orUnknown(o.PayoutReference), orUnknown(o.PayoutProvider),
+			strings.Join(earlier, ", "))
+	}
+	if induced > 0 {
+		item.Expected += fmt.Sprintf("; %d induced %s, never sent", induced, plural(induced, "attempt", "attempts"))
 	}
 
-	result, err := r.e.Payouts.Status(o.ID)
-	if errors.Is(err, payout.ErrNotFound) {
-		if refunded {
-			return r.ok(item, "the Linq backend has no payout for this order")
+	answers := make([]payoutAnswer, len(refs))
+	for i, ref := range refs {
+		res, err := r.e.Payouts.Status(ref)
+		if err != nil && !errors.Is(err, payout.ErrNotFound) {
+			if len(refs) > 1 {
+				err = fmt.Errorf("%s: %w", ref, err)
+			}
+			return r.unanswered(item, err)
 		}
-		return r.mismatch(item, "the Linq backend has no payout for this order")
+		answers[i] = payoutAnswer{ref: ref, found: err == nil, result: res}
 	}
-	if err != nil {
-		return r.unanswered(item, err)
-	}
-	actual := describePayout(result)
-
-	if refunded {
-		if result.Status == payout.StatusFailed {
-			return r.ok(item, actual)
-		}
-		// Paid, or still going: either way the merchant may be paid on top of
-		// a refund that has already gone out on-chain.
-		return r.mismatch(item, actual)
-	}
+	actual := describeAnswers(answers)
 
 	var problems []string
-	if result.Status != payout.StatusPaid {
-		problems = append(problems, "not paid")
-	}
-	if o.PayoutReference != "" && result.Reference != o.PayoutReference {
-		problems = append(problems, "a different payout ID")
-	}
-	if o.PayoutProvider != "" && result.Provider != o.PayoutProvider {
-		problems = append(problems, "a different provider")
-	}
-	if result.AmountNGN != nil && money.RoundNGN(*result.AmountNGN) != money.RoundNGN(o.AmountNGN) {
-		problems = append(problems, "a different amount")
+	if refunded {
+		for _, a := range answers {
+			// Paid, or still going: either way the merchant may be paid on top
+			// of a refund that has already gone out on-chain.
+			if p := a.paidOrGoing(); p != "" {
+				problems = append(problems, a.name(len(refs))+p+", but the USDC was refunded")
+			}
+		}
+	} else {
+		final := answers[len(answers)-1]
+		if !final.found {
+			if len(refs) == 1 {
+				return r.mismatch(item, "the Linq backend has no payout for this order")
+			}
+			problems = append(problems, "no payout under "+last)
+		} else {
+			res := final.result
+			if res.Status != payout.StatusPaid {
+				problems = append(problems, "not paid")
+			}
+			if o.PayoutReference != "" && res.Reference != o.PayoutReference {
+				problems = append(problems, "a different payout ID")
+			}
+			if o.PayoutProvider != "" && res.Provider != o.PayoutProvider {
+				problems = append(problems, "a different provider")
+			}
+			if res.AmountNGN != nil && money.RoundNGN(*res.AmountNGN) != money.RoundNGN(o.AmountNGN) {
+				problems = append(problems, "a different amount")
+			}
+		}
+		for _, a := range answers[:len(answers)-1] {
+			switch a.paidOrGoing() {
+			case "paid":
+				problems = append(problems, "also paid under "+a.ref+": the merchant may have been paid twice")
+			case "still in progress":
+				problems = append(problems, a.ref+" still in progress")
+			}
+		}
 	}
 	if len(problems) > 0 {
 		return r.mismatch(item, actual+" ("+strings.Join(problems, ", ")+")")
 	}
 	return r.ok(item, actual)
+}
+
+// payoutRefs lists the references the payout worker sent the Linq backend for
+// an order, oldest first, with the reference of its last attempt at the end,
+// and counts the induced attempts, which never reached the backend.
+//
+// With PAYOUT_NEW_REFERENCE_ON_RETRY off every attempt reuses the order ID, so
+// that is one reference. An order with no attempt on record, paid before
+// attempts were recorded, or with only induced ones, is asked about by its ID:
+// the reference every payout used before retries had their own.
+func payoutRefs(orderID string, attempts []store.PayoutAttempt) (refs []string, induced int) {
+	for _, a := range attempts {
+		if a.Induced {
+			induced++
+			continue
+		}
+		for i, ref := range refs {
+			if ref == a.Reference {
+				refs = append(refs[:i], refs[i+1:]...)
+				break
+			}
+		}
+		refs = append(refs, a.Reference)
+	}
+	if len(refs) == 0 {
+		refs = []string{orderID}
+	}
+	return refs, induced
+}
+
+// payoutAnswer is what the Linq backend said about one reference.
+type payoutAnswer struct {
+	ref    string
+	found  bool
+	result payout.Result
+}
+
+// paidOrGoing says whether a reference paid, or may yet: "paid", "still in
+// progress", or "" when it failed or never reached the backend.
+func (a payoutAnswer) paidOrGoing() string {
+	switch {
+	case !a.found || a.result.Status == payout.StatusFailed:
+		return ""
+	case a.result.Status == payout.StatusPaid:
+		return "paid"
+	default:
+		return "still in progress"
+	}
+}
+
+// name prefixes a problem with the reference, when there is more than one.
+func (a payoutAnswer) name(refs int) string {
+	if refs == 1 {
+		return ""
+	}
+	return a.ref + " "
+}
+
+// describeAnswers says what the Linq backend reported for each reference.
+func describeAnswers(answers []payoutAnswer) string {
+	if len(answers) == 1 {
+		if !answers[0].found {
+			return "the Linq backend has no payout for this order"
+		}
+		return describePayout(answers[0].result)
+	}
+	parts := make([]string, len(answers))
+	for i, a := range answers {
+		if !a.found {
+			parts[i] = a.ref + ": no payout"
+			continue
+		}
+		parts[i] = a.ref + ": " + describePayout(a.result)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // describePayout says what the Linq backend reported, without bank details:

@@ -116,7 +116,7 @@ mismatch as `reconciliation mismatch`.
 |---|---|---|
 | `RECONCILE_INTERVAL` | `15m` | Time between cycles, at least `1m` |
 | `RECONCILE_HORIZON_CALLS` | `200` | Horizon requests one cycle may make. What it cannot reach waits for the next cycle, newest orders first. Four cycles an hour at 200 is 800 requests, well inside Horizon's 3,600 an hour |
-| `RECONCILE_PAYOUT_CALLS` | `50` | `GET /internal/payout` requests one cycle may make to the Linq backend |
+| `RECONCILE_PAYOUT_CALLS` | `50` | `GET /internal/payout` requests one cycle may make to the Linq backend. An order is asked about under each payout reference it used, so a payout retried under new references costs one request per reference |
 | `RECONCILE_SPONSORED_ACCOUNTS` | off | Exactly `true` turns on the check for accounts the sponsor pays reserves for with no order or pool row behind them. **Leave it off on mainnet until you know no other service uses the same sponsor account** (Linq-v2 has a `STELLAR_SPONSOR_KEY` too): every account another service opens would be reported |
 
 To record why a mismatch is not a problem, or what was done about it (needs

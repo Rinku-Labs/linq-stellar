@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +105,7 @@ type fakePayouts struct {
 	results map[string]payout.Result
 	fail    map[string]error
 	calls   int
+	asked   []string
 	panicOn string
 }
 
@@ -113,6 +115,7 @@ func newPayouts() *fakePayouts {
 
 func (f *fakePayouts) Status(reference string) (payout.Result, error) {
 	f.calls++
+	f.asked = append(f.asked, reference)
 	if reference == f.panicOn {
 		panic("payout client blew up")
 	}
@@ -524,6 +527,174 @@ func TestWithoutAPayoutProviderThePayoutCheckDoesNotRun(t *testing.T) {
 	o := h.order(1, store.Order{Status: store.StateSettledInTreasury, FinancialOutcome: "disbursed"})
 	_, items := h.cycle()
 	absent(t, items, o.ID+"/payout")
+}
+
+// attempts records an order's payout attempts, numbered from 1, as the payout
+// worker writes them.
+func (h *harness) attempts(orderID string, list ...store.PayoutAttempt) {
+	h.t.Helper()
+	for i := range list {
+		list[i].OrderID, list[i].Number = orderID, i+1
+		if err := h.db.Create(&list[i]).Error; err != nil {
+			h.t.Fatalf("create attempt: %v", err)
+		}
+	}
+}
+
+func sent(ref, outcome string) store.PayoutAttempt {
+	return store.PayoutAttempt{Reference: ref, Outcome: outcome, RetrySafe: outcome == store.PayoutFailed}
+}
+
+func inducedAttempt(ref string) store.PayoutAttempt {
+	return store.PayoutAttempt{Reference: ref, Outcome: store.PayoutFailed, RetrySafe: true, Induced: true, Reason: store.InducedReason}
+}
+
+// With PAYOUT_NEW_REFERENCE_ON_RETRY a retry is a new payout under its own
+// reference, so every reference the order sent is asked about. An earlier one
+// that paid as well is the merchant paid twice.
+func TestRetriedPayoutsAreCheckedUnderEveryReference(t *testing.T) {
+	h := newHarness(t)
+	paidOrder := func(n int) store.Order {
+		return h.order(n, store.Order{Status: store.StateSettledInTreasury, FinancialOutcome: "disbursed",
+			AmountNGN: 10000, PayoutReference: "lq_" + strconv.Itoa(n), PayoutProvider: "nomba"})
+	}
+	refundedOrder := func(n int) store.Order {
+		return h.order(n, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	}
+	failedAt := func(ref string) payout.Result {
+		return payout.Result{Status: payout.StatusFailed, Reference: ref, Provider: "nomba"}
+	}
+	paidAt := func(ref string) payout.Result {
+		return payout.Result{Status: payout.StatusPaid, Reference: ref, Provider: "nomba", AmountNGN: ngn(10000)}
+	}
+
+	retried := paidOrder(1)
+	h.attempts(retried.ID, sent(retried.ID, store.PayoutFailed), sent(retried.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[retried.ID] = failedAt("lq_1a")
+	h.payouts.results[retried.ID+"-p2"] = paidAt("lq_1")
+
+	paidTwice := paidOrder(2)
+	h.attempts(paidTwice.ID, sent(paidTwice.ID, store.PayoutFailed), sent(paidTwice.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[paidTwice.ID] = paidAt("lq_2a")
+	h.payouts.results[paidTwice.ID+"-p2"] = paidAt("lq_2")
+
+	earlierGoing := paidOrder(3)
+	h.attempts(earlierGoing.ID, sent(earlierGoing.ID, store.PayoutFailed), sent(earlierGoing.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[earlierGoing.ID] = payout.Result{Status: payout.StatusQueued, Reference: "lq_3a", Provider: "nomba"}
+	h.payouts.results[earlierGoing.ID+"-p2"] = paidAt("lq_3")
+
+	// A transient induced failure: attempt 1 never reached Linq.
+	inducedThenPaid := paidOrder(4)
+	h.attempts(inducedThenPaid.ID, inducedAttempt(inducedThenPaid.ID), sent(inducedThenPaid.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[inducedThenPaid.ID+"-p2"] = paidAt("lq_4")
+
+	// The switch off: every attempt reused the order ID, which is one payout.
+	switchOff := refundedOrder(5)
+	h.attempts(switchOff.ID, sent(switchOff.ID, store.PayoutFailed), sent(switchOff.ID, store.PayoutFailed), sent(switchOff.ID, store.PayoutFailed))
+	h.payouts.results[switchOff.ID] = failedAt("lq_5")
+
+	// A terminal induced failure: nothing was ever sent.
+	terminal := refundedOrder(6)
+	h.attempts(terminal.ID, inducedAttempt(terminal.ID), inducedAttempt(terminal.ID+"-p2"), inducedAttempt(terminal.ID+"-p3"))
+
+	refundedRetries := refundedOrder(7)
+	h.attempts(refundedRetries.ID, sent(refundedRetries.ID, store.PayoutFailed),
+		sent(refundedRetries.ID+"-p2", store.PayoutFailed), sent(refundedRetries.ID+"-p3", store.PayoutFailed))
+	for _, ref := range []string{refundedRetries.ID, refundedRetries.ID + "-p2", refundedRetries.ID + "-p3"} {
+		h.payouts.results[ref] = failedAt("lq_7")
+	}
+
+	refundedButPaid := refundedOrder(8)
+	h.attempts(refundedButPaid.ID, sent(refundedButPaid.ID, store.PayoutFailed),
+		sent(refundedButPaid.ID+"-p2", store.PayoutFailed), sent(refundedButPaid.ID+"-p3", store.PayoutFailed))
+	h.payouts.results[refundedButPaid.ID] = failedAt("lq_8a")
+	h.payouts.results[refundedButPaid.ID+"-p2"] = paidAt("lq_8b")
+	h.payouts.results[refundedButPaid.ID+"-p3"] = failedAt("lq_8c")
+
+	unreachable := paidOrder(9)
+	h.attempts(unreachable.ID, sent(unreachable.ID, store.PayoutFailed), sent(unreachable.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[unreachable.ID] = failedAt("lq_9a")
+	h.payouts.fail[unreachable.ID+"-p2"] = errors.New("payout: connection refused")
+
+	lastMissing := paidOrder(10)
+	h.attempts(lastMissing.ID, sent(lastMissing.ID, store.PayoutFailed), sent(lastMissing.ID+"-p2", store.PayoutPaid))
+	h.payouts.results[lastMissing.ID] = failedAt("lq_10a")
+
+	_, items := h.cycle()
+
+	ok := expect(t, items, retried.ID+"/payout", store.ReconcileOK)
+	if want := "paid ₦10000.00 under ord_001-p2, payout lq_1 via nomba; nothing paid under ord_001"; ok.Expected != want {
+		t.Errorf("retried expected %q, want %q", ok.Expected, want)
+	}
+	if want := "ord_001: failed, amount not reported, payout lq_1a via nomba; ord_001-p2: paid, ₦10000.00, payout lq_1 via nomba"; ok.Actual != want {
+		t.Errorf("retried actual %q, want %q", ok.Actual, want)
+	}
+	if m := expect(t, items, paidTwice.ID+"/payout", store.ReconcileMismatch); !strings.Contains(m.Actual, "(also paid under ord_002: the merchant may have been paid twice)") {
+		t.Errorf("paid twice: %q", m.Actual)
+	}
+	if m := expect(t, items, earlierGoing.ID+"/payout", store.ReconcileMismatch); !strings.Contains(m.Actual, "(ord_003 still in progress)") {
+		t.Errorf("earlier still going: %q", m.Actual)
+	}
+	if ok := expect(t, items, inducedThenPaid.ID+"/payout", store.ReconcileOK); ok.Expected != "paid ₦10000.00, payout lq_4 via nomba; 1 induced attempt, never sent" {
+		t.Errorf("induced then paid: %q", ok.Expected)
+	}
+	if ok := expect(t, items, switchOff.ID+"/payout", store.ReconcileOK); ok.Expected != "no NGN paid: the payout failed and the USDC was refunded" {
+		t.Errorf("switch off: %q", ok.Expected)
+	}
+	if ok := expect(t, items, terminal.ID+"/payout", store.ReconcileOK); ok.Expected != "no NGN paid: the payout failed and the USDC was refunded; 3 induced attempts, never sent" ||
+		ok.Actual != "the Linq backend has no payout for this order" {
+		t.Errorf("terminal induced: %+v", ok)
+	}
+	if ok := expect(t, items, refundedRetries.ID+"/payout", store.ReconcileOK); ok.Expected != "no NGN paid under ord_007, ord_007-p2, ord_007-p3: the payout failed and the USDC was refunded" {
+		t.Errorf("refunded retries: %q", ok.Expected)
+	}
+	if m := expect(t, items, refundedButPaid.ID+"/payout", store.ReconcileMismatch); !strings.HasSuffix(m.Actual, "(ord_008-p2 paid, but the USDC was refunded)") {
+		t.Errorf("refunded but paid: %q", m.Actual)
+	}
+	if e := expect(t, items, unreachable.ID+"/payout", store.ReconcileError); e.Actual != "could not check: ord_009-p2: payout: connection refused" {
+		t.Errorf("unreachable: %q", e.Actual)
+	}
+	if m := expect(t, items, lastMissing.ID+"/payout", store.ReconcileMismatch); m.Actual != "ord_010: failed, amount not reported, payout lq_10a via nomba; ord_010-p2: no payout (no payout under ord_010-p2)" {
+		t.Errorf("last reference unknown to Linq: %q", m.Actual)
+	}
+
+	// Each reference sent is asked about once; an induced attempt was never
+	// sent, so it is not asked about, unless nothing else was sent at all.
+	asked := map[string]int{}
+	for _, ref := range h.payouts.asked {
+		asked[ref]++
+	}
+	for _, ref := range []string{inducedThenPaid.ID, terminal.ID + "-p2", terminal.ID + "-p3"} {
+		if asked[ref] != 0 {
+			t.Errorf("asked about %s, which was never sent", ref)
+		}
+	}
+	if asked[switchOff.ID] != 1 || asked[terminal.ID] != 1 || asked[refundedRetries.ID+"-p3"] != 1 {
+		t.Errorf("asked: %v", asked)
+	}
+}
+
+// An order's payout is checked whole or not at all, and never over budget.
+func TestAPayoutIsCheckedWholeOrNotAtAll(t *testing.T) {
+	h := newHarness(t)
+	h.engine.PayoutCalls = 2
+	older := h.order(1, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	newer := h.order(2, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	h.attempts(newer.ID, sent(newer.ID, store.PayoutFailed), sent(newer.ID+"-p2", store.PayoutFailed), sent(newer.ID+"-p3", store.PayoutFailed))
+
+	_, first := h.cycle()
+	absent(t, first, newer.ID+"/payout")
+	expect(t, first, older.ID+"/payout", store.ReconcileOK)
+	if h.payouts.calls != 1 {
+		t.Errorf("first cycle asked %d times, want 1: the three-reference order waits", h.payouts.calls)
+	}
+
+	h.engine.PayoutCalls = 3
+	_, second := h.cycle()
+	expect(t, second, newer.ID+"/payout", store.ReconcileOK)
+	if h.payouts.calls != 4 {
+		t.Errorf("after the second cycle %d calls, want 4", h.payouts.calls)
+	}
 }
 
 // A check that passed has its answer; a mismatch is looked at again until
