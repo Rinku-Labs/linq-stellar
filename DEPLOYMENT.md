@@ -59,6 +59,33 @@ preflight, `stellar.toml` and SEP-10 all stay open to anyone, as designed. The
 `worker` binary never serves HTTP, so it neither needs nor reads this
 variable; setting it there is harmless but does nothing.
 
+### Public API (`server` only, both optional)
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PUBLIC_API_ENABLED` | off | Serves `/v1` and `/admin` when exactly `true`. Orders taken on `/v1` move money, so this is the off switch: unset it and redeploy, and those routes stop existing whatever keys were issued. The legacy `/orders` routes do not depend on it |
+| `ADMIN_API_KEY` | empty | Sent as `X-Admin-Key` to `/admin`. Empty refuses every admin request. Generate: `openssl rand -hex 32` |
+| `DB_MAX_OPEN_CONNS` | `20` | Connections the server may hold to Postgres, per instance. Keep instances x this below the database's `max_connections`, leaving room for the worker |
+
+Setting up an integrator (the full key appears once, in the second response):
+
+```bash
+curl -X POST $HOST/admin/integrators -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"name":"Acme"}'   # optional "rateLimitPerMinute"
+curl -X POST $HOST/admin/integrators/$INTEGRATOR_ID/keys -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+`POST /v1/orders` takes one of `amountNgn` or `amountUsdc` and no `rate`. This
+service prices the order from `GET /b2b/rate` on `LINQ_API_URL`, reused for up to
+30 seconds, and returns the rate it used. If that route cannot be reached, orders
+get 503 until it can. Sending `rate` or both amounts is a 400.
+
+The other admin routes are `PUT /admin/integrators/{id}/rate-limit`
+(`{"rateLimitPerMinute": 300}`, or `null` to go back to the default of 120),
+`POST /admin/keys/{id}/rotate`, `POST /admin/keys/{id}/revoke` and
+`GET /admin/credential-events` (`integratorId`, `keyId`, `limit`). Rate limit
+refusals are logged as `rate limit refused` with the key ID and time.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 
