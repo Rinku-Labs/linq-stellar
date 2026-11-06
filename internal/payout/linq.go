@@ -22,7 +22,7 @@ import (
 //	  -> 200/202 {status, payoutId, provider}
 //
 //	GET  /internal/payout?reference=<id>
-//	  -> 200 {status, payoutId, provider, failureReason, amountNGN?}
+//	  -> 200 {status, payoutId, provider, failureReason, retrySafe, amountNGN?}
 //	  -> 404 when no payout has that reference
 //
 // Both must be idempotent on reference. The public POST /b2b/offramp cannot
@@ -59,7 +59,12 @@ type payoutResponse struct {
 	PayoutID      string `json:"payoutId"`
 	Provider      string `json:"provider"`
 	FailureReason string `json:"failureReason"`
-	Message       string `json:"message"`
+	// RetrySafe is Linq's statement that a failed payout moved no money. Linq
+	// reports "failed" for some outcomes the bank never confirmed, such as an
+	// HTTP 5xx from the bank, so "failed" alone does not make a new reference
+	// safe.
+	RetrySafe bool   `json:"retrySafe"`
+	Message   string `json:"message"`
 	// AmountNGN is optional: the Linq backend does not send it yet.
 	AmountNGN *float64 `json:"amountNGN"`
 }
@@ -180,6 +185,7 @@ func toResult(r payoutResponse) Result {
 		Reference:     r.PayoutID,
 		Provider:      r.Provider,
 		FailureReason: r.FailureReason,
+		RetrySafe:     status == StatusFailed && r.RetrySafe,
 		AmountNGN:     r.AmountNGN,
 	}
 }

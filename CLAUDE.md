@@ -183,6 +183,28 @@ lanes existed. Never regenerate it to make a test pass.
   one and the sweep falls back to reading most of the table. Adding a state to
   `notifiable` means adding it there, and replacing the index.
 
+## Payout attempts and references
+
+Each try at a payout is a `store.PayoutAttempt`, written before the request is
+sent. Its reference is the idempotency key Linq sees: the order ID, then
+`<order>-p2`, `-p3` when `PAYOUT_NEW_REFERENCE_ON_RETRY=true`.
+
+- **A new reference only after a confirmed, retry-safe failure.** The
+  confirmation is `GET /internal/payout` saying `failed` with
+  `retrySafe: true`. A `failed` from the POST, a timeout, an error or `queued`
+  means resend the same reference later (`wait`). Linq reports `failed` for
+  some outcomes the bank never confirmed, such as an HTTP 5xx from the bank, so
+  `failed` alone is not proof that no money moved.
+- **An unknown outcome never refunds and never counts as an attempt.** The
+  order goes back to `payout_queued` with `payout_after` 30 seconds out.
+- **With the switch on, a failure that is not retry-safe goes to `failed`** for
+  a person. A retry could pay twice, and a refund on top of a payout that went
+  through pays the payer twice.
+- **Induced failures** (`POST /admin/orders/{id}/induce-payout-failure`) are
+  for Linq's own test orders. They need `integrators.allow_failure_injection`,
+  which has no route and is set in the database. An induced attempt is recorded
+  with reason `induced for demonstration` and never reaches the provider.
+
 ## Reconciliation reads and records, never acts
 
 `internal/reconcile` checks the order table against Horizon and the Linq backend

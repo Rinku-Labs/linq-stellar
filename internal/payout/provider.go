@@ -15,8 +15,9 @@ import (
 
 // Request is one NGN disbursement.
 type Request struct {
-	// Reference is the Stellar order ID. It doubles as the idempotency key, so
-	// a retry after a timeout resumes the same payout rather than sending a
+	// Reference is the idempotency key: the Stellar order ID, or a later
+	// attempt's own reference (see store.PayoutReference). Resending the same
+	// reference after a timeout resumes that payout rather than sending a
 	// second one — the failure mode that matters most here, because a duplicate
 	// payout is real money and cannot be recalled.
 	Reference string
@@ -76,6 +77,10 @@ type Result struct {
 	// AmountNGN is what the provider says it paid, when it says. Nil means it
 	// did not report an amount, which is not the same as zero.
 	AmountNGN *float64
+	// RetrySafe is set with StatusFailed when the provider confirms no money
+	// moved, so a payout under a new reference cannot pay twice. A failure
+	// without it may still have reached the bank.
+	RetrySafe bool
 }
 
 // Provider disburses NGN.

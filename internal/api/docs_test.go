@@ -142,6 +142,9 @@ func TestRepliesMatchTheSpec(t *testing.T) {
 	if err := p.db.Create(&event).Error; err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
+	if _, err := store.RecordInducedFailure(p.db, "full", 1, "full"); err != nil {
+		t.Fatalf("seed payout attempt: %v", err)
+	}
 	read := p.asKey(key, http.MethodGet, "/v1/orders/full", "")
 	if read.Code != http.StatusOK {
 		t.Fatalf("read: %d %s", read.Code, read.Body.String())
@@ -151,6 +154,11 @@ func TestRepliesMatchTheSpec(t *testing.T) {
 	for _, entry := range fullBody["statusHistory"].([]any) {
 		assertMatchesSchema(t, schemas["StatusEvent"], entry.(map[string]any))
 	}
+	attempts, _ := fullBody["payoutAttempts"].([]any)
+	if len(attempts) != 1 {
+		t.Fatalf("payoutAttempts: %v", fullBody["payoutAttempts"])
+	}
+	assertMatchesSchema(t, schemas["PayoutAttempt"], attempts[0].(map[string]any))
 
 	rotated := p.asKey(key, http.MethodPost, "/v1/keys/rotate", "")
 	if rotated.Code != http.StatusCreated {

@@ -57,6 +57,10 @@ type Config struct {
 	// taken there move money, and turning it off must not touch the legacy
 	// routes.
 	PublicAPIEnabled bool
+	// PayoutNewReferenceOnRetry gives each payout retry its own reference, so a
+	// retry after a confirmed failure really pays. Off unless set to "true";
+	// see payout.Worker.NewReferenceOnRetry.
+	PayoutNewReferenceOnRetry bool
 	// AdminAPIKey guards /admin, sent as X-Admin-Key. Empty refuses every admin
 	// request; the server still starts, so the legacy routes never depend on it.
 	AdminAPIKey string
@@ -114,6 +118,8 @@ func Load() (Config, error) {
 		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
 		PublicAPIEnabled:  os.Getenv("PUBLIC_API_ENABLED") == "true",
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
+
+		PayoutNewReferenceOnRetry: os.Getenv("PAYOUT_NEW_REFERENCE_ON_RETRY") == "true",
 
 		MerchantWebhookURL:   os.Getenv("MERCHANT_WEBHOOK_URL"),
 		MerchantWebhookSecret: os.Getenv("MERCHANT_WEBHOOK_SECRET"),

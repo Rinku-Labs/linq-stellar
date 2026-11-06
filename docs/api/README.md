@@ -157,7 +157,7 @@ Over the limit you get `429` with a `Retry-After` header, the number of seconds 
 
 From `disbursed` onwards your merchant has their money, so treat `disbursed` as paid.
 
-An order also reports `statusHistory`, each move with its time, and `statusReason`, a short fixed message when a payout failed, such as "The payout could not be completed, so the deposit is being refunded." Contact Linq for the specific cause. Once it applies, `payoutReference` identifies the bank transfer, and `depositTxHash`, `sweepTxHash` and `refundTxHash` are Stellar transactions.
+An order also reports `statusHistory`, each move with its time, and `statusReason`, a short fixed message when a payout failed, such as "The payout could not be completed, so the deposit is being refunded." Contact Linq for the specific cause. Once it applies, `payoutReference` identifies the bank transfer, and `depositTxHash`, `sweepTxHash` and `refundTxHash` are Stellar transactions. `payoutAttempts` lists each try at the payout, first to last, with the reference sent to the payout provider; a retry after a confirmed failure has a reference of its own.
 
 ## Webhooks
 

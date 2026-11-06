@@ -85,6 +85,42 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.requireAdminKey(s.handleRevokeKey))
 	mux.HandleFunc("GET /admin/credential-events", s.requireAdminKey(s.handleCredentialEvents))
 	mux.HandleFunc("POST /admin/reconciliation/items/{id}/resolve", s.requireAdminKey(s.handleResolveReconciliationItem))
+	mux.HandleFunc("POST /admin/orders/{id}/induce-payout-failure", s.requireAdminKey(s.handleInducePayoutFailure))
+}
+
+// handleInducePayoutFailure makes a Linq test order's payout fail on purpose,
+// to demonstrate the retry and refund paths. See store.InducePayoutFailure.
+func (s *Server) handleInducePayoutFailure(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	id := r.PathValue("id")
+	err := store.InducePayoutFailure(s.DB, id, body.Kind)
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrUnknownInducedKind):
+		writeError(w, http.StatusBadRequest, "kind must be transient or terminal")
+		return
+	case errors.Is(err, store.ErrOrderNotFound):
+		writeError(w, http.StatusNotFound, "order not found")
+		return
+	case errors.Is(err, store.ErrFailureInjectionOff):
+		writeError(w, http.StatusForbidden, "failure injection is not allowed for this order's integrator")
+		return
+	case errors.Is(err, store.ErrFailureInjectionTooLate):
+		writeError(w, http.StatusConflict, "the order's payout has already started, or a failure is already induced")
+		return
+	default:
+		s.Log.Error("could not induce a payout failure", "order", id, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "could not induce the failure right now; try again shortly")
+		return
+	}
+	s.Log.Warn("payout failure induced", "order", id, "kind", body.Kind)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "inducedFailure": body.Kind})
 }
 
 // requireIntegratorKey authenticates an issued key, then counts the request
