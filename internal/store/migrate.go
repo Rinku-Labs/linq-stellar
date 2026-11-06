@@ -13,7 +13,7 @@ import "gorm.io/gorm"
 func Migrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(
 		&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{},
-		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{},
+		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{}, &WebhookDelivery{},
 	); err != nil {
 		return err
 	}
@@ -104,6 +104,11 @@ func createWorkerIndexes(db *gorm.DB) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_events_expired
 		   ON credential_events (key_id)
 		   WHERE action = 'expired'`,
+
+		// The notifier's every pass. See owedEvents.
+		`CREATE INDEX IF NOT EXISTS idx_status_events_owed
+		   ON stellar_order_status_events (at, id)
+		   WHERE ` + owedEvents,
 
 		// Pruning: counters are keyed by key first, so the delete by age needs
 		// its own path.

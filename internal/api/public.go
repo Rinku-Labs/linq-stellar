@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Rinku-Labs/linq-stellar/internal/apikey"
+	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"gorm.io/gorm"
 )
@@ -37,9 +38,10 @@ type caller struct {
 	keyID        string
 }
 
-// namesOwnRate is true only for the legacy shared key, which Linq-B2B sends with
-// the rate it fetched from the same source. No issued key ever may.
-func (c caller) namesOwnRate() bool { return c.keyID == "" }
+// legacy is true only for the shared key. Linq-B2B sends that with the rate it
+// fetched from the same source, which no issued key ever may, and it is the only
+// caller shown the raw reasons behind a failed payout.
+func (c caller) legacy() bool { return c.keyID == "" }
 
 type callerKey struct{}
 
@@ -71,6 +73,7 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("POST /admin/integrators", s.requireAdminKey(s.handleCreateIntegrator))
 	mux.HandleFunc("PUT /admin/integrators/{id}/rate-limit", s.requireAdminKey(s.handleSetRateLimit))
+	mux.HandleFunc("PUT /admin/integrators/{id}/webhook", s.requireAdminKey(s.handleSetWebhook))
 	mux.HandleFunc("POST /admin/integrators/{id}/keys", s.requireAdminKey(s.handleIssueKey))
 	mux.HandleFunc("POST /admin/keys/{id}/rotate", s.requireAdminKey(s.handleAdminRotateKey))
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.requireAdminKey(s.handleRevokeKey))
@@ -290,6 +293,79 @@ func (s *Server) handleSetRateLimit(w http.ResponseWriter, r *http.Request) {
 }
 
 func validLimit(limit *int) bool { return limit == nil || *limit > 0 }
+
+// handleSetWebhook points an integrator's events at a URL. The first URL mints the
+// secret that signs them, shown only in that reply; a later one keeps it, so a
+// move of endpoint does not break the receiver's signature check. An empty url
+// clears both, which is also how a secret is replaced. Linq-B2B is refused: its
+// webhook comes from MERCHANT_WEBHOOK_URL.
+func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	id := r.PathValue("id")
+	if id == store.LegacyIntegratorID {
+		writeError(w, http.StatusConflict, "this integrator's webhook is set by MERCHANT_WEBHOOK_URL")
+		return
+	}
+
+	if body.URL == "" {
+		if err := store.SetWebhook(s.DB, id, "", ""); err != nil {
+			s.writeCredentialError(w, "clear the webhook", err)
+			return
+		}
+		s.Log.Info("integrator webhook cleared", "integrator", id)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "webhookUrl": nil})
+		return
+	}
+
+	if err := notify.ValidateWebhookURL(body.URL); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	_, existing, err := store.LoadWebhook(s.DB, id)
+	if err != nil {
+		s.writeCredentialError(w, "load the webhook", err)
+		return
+	}
+	if existing != "" {
+		if err := store.SetWebhookURL(s.DB, id, body.URL); err != nil {
+			s.writeCredentialError(w, "set the webhook", err)
+			return
+		}
+		s.Log.Info("integrator webhook moved", "integrator", id)
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "webhookUrl": body.URL})
+		return
+	}
+
+	secret, err := apikey.NewWebhookSecret()
+	if err != nil {
+		s.writeCredentialError(w, "create the webhook secret", err)
+		return
+	}
+	// EncryptSeed seals any secret; the name is for its first use.
+	sealed, err := s.Chain.EncryptSeed(secret)
+	if err != nil {
+		s.writeCredentialError(w, "seal the webhook secret", err)
+		return
+	}
+	if err := store.SetWebhook(s.DB, id, body.URL, sealed); err != nil {
+		s.writeCredentialError(w, "set the webhook", err)
+		return
+	}
+
+	s.Log.Info("integrator webhook set", "integrator", id)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            id,
+		"webhookUrl":    body.URL,
+		"webhookSecret": secret,
+	})
+}
 
 func (s *Server) handleIssueKey(w http.ResponseWriter, r *http.Request) {
 	issued, err := store.IssueKey(s.DB, r.PathValue("id"), s.keyMode(), store.ActorAdmin, s.now())

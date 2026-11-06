@@ -61,6 +61,15 @@ func New(mode string) (full, prefix string, err error) {
 	return fmt.Sprintf("lq_%s_%s_%s", mode, prefix, secret), prefix, nil
 }
 
+// NewWebhookSecret returns a secret for signing an integrator's webhooks.
+func NewWebhookSecret() (string, error) {
+	secret, err := random(secretLen)
+	if err != nil {
+		return "", err
+	}
+	return "whsec_" + secret, nil
+}
+
 // Prefix extracts the lookup prefix from a presented key.
 func Prefix(full string) (string, error) {
 	if len(full) > maxLen {

@@ -156,6 +156,31 @@ caller comes from the request context, so the two cannot drift apart.
 - **`rate limit refused` log lines are the proof of enforcement.** Counter rows
   are gone within the hour, so nothing else records a refusal.
 
+## Webhooks go to whoever created the order
+
+`internal/notify` works one lane per integrator. Linq-B2B's lane uses
+`MERCHANT_WEBHOOK_URL` and `MERCHANT_WEBHOOK_SECRET`, and its deliveries must not
+change: `testdata/legacy_delivery.golden` was captured from the code before
+lanes existed. Never regenerate it to make a test pass.
+
+- **A lane exists so one endpoint can't hold up the others.** Delivering
+  sequentially, a hanging endpoint costs everyone behind it the timeout per event.
+- **An integrator's URL is untrusted, and the worker calls it from inside our
+  network.** `NewIntegratorClient` refuses non-public addresses at dial time,
+  after DNS, and follows no redirects. Send to these URLs with no other client.
+- **An integrator's delivery is never unsigned.** No secret means no delivery,
+  and the report stays owed.
+- **A failing integrator gets one attempt per backoff, not one per event.**
+  Linq-B2B keeps its old behaviour of trying each event.
+- **An integrator never sees a stored reason.** It quotes payout providers and
+  internal URLs. `store.PublicReason` is what the webhook and `/v1` show, and a
+  state with no message there shows nothing. Linq-B2B keeps the raw text.
+- **Log and store the host, never the URL.** A path can carry the integrator's
+  token, and `cleanError` removes it from errors.
+- **`owedEvents` is the query and the index predicate, word for word.** Change
+  one and the sweep falls back to reading most of the table. Adding a state to
+  `notifiable` means adding it there, and replacing the index.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every
