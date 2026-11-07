@@ -278,6 +278,11 @@ when that is set.
   resolution are free text, and a resolution is typed by a person.
 - **No scripts.** The CSP is `default-src 'none'`, and the overview refreshes
   with a meta tag. Adding JavaScript means changing the CSP on purpose.
+- **It counts and lists problems, not copies.** An unexplained mismatch is
+  recorded again every cycle, so the overview's counts and the mismatch list
+  group items by `problemKey` (order, account, check, answer). A problem is
+  resolved when any copy has a note. Each cycle's own page still shows every
+  item it recorded.
 
 ## Logs name their source
 

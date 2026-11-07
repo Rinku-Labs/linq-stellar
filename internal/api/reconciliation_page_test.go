@@ -250,7 +250,7 @@ func TestTheOverviewShowsEveryCycle(t *testing.T) {
 	for _, want := range []string{
 		`<meta http-equiv="refresh" content="60">`,
 		`<span>Cycles completed</span><b>1</b>`,
-		`<span>Mismatches recorded</span><b>1</b>`,
+		`<span>Mismatches found</span><b>1</b>`,
 		`<span>Not yet resolved</span><b>1</b>`,
 		fmt.Sprintf(`<a href="/reconciliation/cycles/%d">#%d</a>`, finished.ID, finished.ID),
 		"42s",
@@ -368,6 +368,61 @@ func TestAllMismatchesAreListedTogether(t *testing.T) {
 	}
 	if a, b := strings.Index(page, "second_mismatch"), strings.Index(page, "first_mismatch"); a < 0 || b < 0 || a > b {
 		t.Error("both mismatches, newest first")
+	}
+}
+
+// An unexplained mismatch is found again every cycle. The counts and the list
+// show it once, and a note on any copy resolves it. (Tanta's review of #7.)
+func TestAProblemFoundEveryCycleIsCountedOnce(t *testing.T) {
+	p := newReviewerPage(t, "")
+	stuck := store.ReconciliationItem{OrderID: "ord_stuck", CheckName: "payout", Result: store.ReconcileMismatch,
+		Expected: "no NGN paid", Actual: "queued, amount not reported, payout lq_1 via nomba"}
+	other := store.ReconciliationItem{OrderID: "ord_other", CheckName: "account_closed", Result: store.ReconcileMismatch,
+		Actual: "the account still exists, holding 0.00 USDC"}
+	var copies []store.ReconciliationCycle
+	for i := 3; i >= 1; i-- {
+		copies = append(copies, p.cycle(p.clock.Add(-time.Duration(i)*15*time.Minute), at(p.clock), "", stuck, other))
+	}
+	counts := func() (int64, int64) {
+		total, unresolved, err := store.MismatchCounts(p.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return total, unresolved
+	}
+	if total, unresolved := counts(); total != 2 || unresolved != 2 {
+		t.Errorf("two problems found three times each: %d found, %d unresolved, want 2 and 2", total, unresolved)
+	}
+
+	// Resolve the oldest copy of one: every copy is covered.
+	items, _ := store.CycleItems(p.db, copies[0].ID, true)
+	for _, item := range items {
+		if item.OrderID == "ord_stuck" {
+			if _, err := store.ResolveReconciliationItem(p.db, item.ID, "Nomba pending, watching", "ify", p.clock); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if total, unresolved := counts(); total != 2 || unresolved != 1 {
+		t.Errorf("after one note: %d found, %d unresolved, want 2 and 1", total, unresolved)
+	}
+
+	page := p.get("/reconciliation")
+	for _, want := range []string{`<span>Mismatches found</span><b>2</b>`, `<span>Not yet resolved</span><b>1</b>`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("overview should show %s", want)
+		}
+	}
+	list := p.get("/reconciliation/mismatches")
+	if n := strings.Count(list, "ord_stuck"); n != 1 {
+		t.Errorf("the stuck payout is listed %d times, want once", n)
+	}
+	if !strings.Contains(list, "Nomba pending, watching") {
+		t.Error("the list shows the problem with its note")
+	}
+	// A cycle's own page still shows its copy.
+	if page := p.get(fmt.Sprintf("/reconciliation/cycles/%d", copies[2].ID)); !strings.Contains(page, "ord_stuck") {
+		t.Error("each cycle keeps its own record of the check")
 	}
 }
 

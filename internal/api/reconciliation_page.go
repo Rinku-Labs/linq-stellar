@@ -449,7 +449,7 @@ const overviewHTML = `{{define "refresh"}}<meta http-equiv="refresh" content="{{
   <p class="lead">Each cycle compares Linq's settlement records with the Stellar ledger ({{.Network}} network) and with the NGN payout records, and writes down every result. It only reads: a mismatch is recorded for a person to look at, never acted on. This page reloads every minute.</p>
   <div class="cards">
     <div class="card"><span>Cycles completed</span><b>{{.Completed}}</b></div>
-    <div class="card"><span>Mismatches recorded</span><b>{{.Mismatches}}</b></div>
+    <div class="card"><span>Mismatches found</span><b>{{.Mismatches}}</b></div>
     <div class="card"><span>Not yet resolved</span><b>{{.Unresolved}}</b></div>
   </div>
   <div class="scroll"><table>
@@ -481,7 +481,7 @@ const cycleHTML = `{{define "content"}}{{template "header" .}}<main>
 
 const mismatchesHTML = `{{define "content"}}{{template "header" .}}<main>
   <h1>All mismatches</h1>
-  <p class="lead">Every mismatch from every cycle, newest first, with how it was resolved.</p>
+  <p class="lead">Every mismatch found, newest first, with how it was resolved. A mismatch nobody has explained yet is found again each cycle; it is listed once here, as last seen. Each cycle's page shows every check it made.</p>
   {{template "items" .Items}}
   {{if .OlderThan}}<p class="pager"><a href="/reconciliation/mismatches?before={{.OlderThan}}">Older mismatches</a></p>{{end}}
 </main>{{end}}`

@@ -170,3 +170,70 @@ func TestOnlyCyclesThatRanToTheEndCount(t *testing.T) {
 		}
 	})
 }
+
+// The reviewer page counts and lists problems, not the copy each cycle records.
+func TestProblemsAreCountedAndListedOnce(t *testing.T) {
+	engines(t, func(t *testing.T, open func() *gorm.DB) {
+		db := open()
+		now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+		var stuckCopies []*ReconciliationItem
+		for i := 0; i < 3; i++ {
+			cycle, _ := StartCycle(db, now)
+			stuck := &ReconciliationItem{CycleID: cycle.ID, OrderID: "o1", CheckName: "payout", Result: ReconcileMismatch, Actual: "queued"}
+			changed := &ReconciliationItem{CycleID: cycle.ID, OrderID: "o1", CheckName: "payout", Result: ReconcileMismatch, Actual: "paid"}
+			stranger := &ReconciliationItem{CycleID: cycle.ID, Account: "GSTRANGER", CheckName: "sponsored_account", Result: ReconcileMismatch, Actual: "no order"}
+			another := &ReconciliationItem{CycleID: cycle.ID, Account: "GANOTHER", CheckName: "sponsored_account", Result: ReconcileMismatch, Actual: "no order"}
+			passed := &ReconciliationItem{CycleID: cycle.ID, OrderID: "o2", CheckName: "payout", Result: ReconcileOK, Actual: "paid"}
+			addItems(t, db, stuck, changed, stranger, another, passed)
+			stuckCopies = append(stuckCopies, stuck)
+		}
+		total, unresolved, err := MismatchCounts(db)
+		if err != nil || total != 4 || unresolved != 4 {
+			t.Errorf("four problems found three times: %d found, %d unresolved, %v", total, unresolved, err)
+		}
+		if _, err := ResolveReconciliationItem(db, stuckCopies[0].ID, "Nomba pending", "ify", now); err != nil {
+			t.Fatal(err)
+		}
+		total, unresolved, err = MismatchCounts(db)
+		if err != nil || total != 4 || unresolved != 3 {
+			t.Errorf("after one note: %d found, %d unresolved, %v", total, unresolved, err)
+		}
+		// A copy written just after the note, by a second worker that looked
+		// first, is still that resolved problem.
+		late, _ := StartCycle(db, now)
+		lateCopy := &ReconciliationItem{CycleID: late.ID, OrderID: "o1", CheckName: "payout", Result: ReconcileMismatch, Actual: "queued"}
+		addItems(t, db, lateCopy)
+		if _, unresolved, _ := MismatchCounts(db); unresolved != 3 {
+			t.Errorf("a late copy of a resolved problem: %d unresolved, want 3", unresolved)
+		}
+		stuckCopies = append(stuckCopies, lateCopy)
+		// A note on one stranger account says nothing about another.
+		var strangerCopy ReconciliationItem
+		db.Where("account = ?", "GSTRANGER").First(&strangerCopy)
+		if _, err := ResolveReconciliationItem(db, strangerCopy.ID, "Opened by hand", "ify", now); err != nil {
+			t.Fatal(err)
+		}
+		if _, unresolved, _ := MismatchCounts(db); unresolved != 2 {
+			t.Errorf("after resolving one stranger: %d unresolved, want 2", unresolved)
+		}
+
+		list, err := ListMismatches(db, 0, 10)
+		if err != nil || len(list) != 4 {
+			t.Fatalf("listed %d problems, want 4: %v", len(list), err)
+		}
+		for i := 1; i < len(list); i++ {
+			if list[i].ID >= list[i-1].ID {
+				t.Errorf("not newest first: %d after %d", list[i].ID, list[i-1].ID)
+			}
+		}
+		for _, item := range list {
+			if item.Actual == "queued" && item.ID != stuckCopies[3].ID {
+				t.Errorf("the stuck problem should be its latest copy: %+v", item)
+			}
+		}
+		older, err := ListMismatches(db, list[0].ID, 10)
+		if err != nil || len(older) != 3 || older[0].ID != list[1].ID {
+			t.Errorf("paging: %+v %v", older, err)
+		}
+	})
+}
