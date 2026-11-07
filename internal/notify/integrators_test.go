@@ -529,3 +529,76 @@ func TestAnIntegratorsWebhookCarriesNoRawFailureText(t *testing.T) {
 		t.Errorf("raw text reached the integrator: %s", body)
 	}
 }
+
+// The review's case: a pass running while a webhook is cleared must not close
+// what was already owed, including a report waiting on a retry.
+func TestClearingAWebhookLosesNothingAlreadyOwed(t *testing.T) {
+	r := newReceiver(t)
+	w := integratorWorker(t, "", "")
+	id := addIntegrator(t, w.DB, "A", r.URL, "secret-a")
+	owe(t, w.DB, id, "ord_owed")
+	owe(t, w.DB, id, "ord_retrying")
+	retryAt := time.Now().UTC().Add(-time.Second)
+	w.DB.Model(&store.StatusEvent{}).Where("order_id = ?", "ord_retrying").
+		Updates(map[string]any{"notify_after": retryAt, "notify_attempts": 2})
+
+	if err := store.ClearWebhook(w.DB, id, time.Now().UTC().Add(time.Millisecond)); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	w.sweep(context.Background())
+
+	for _, order := range []string{"ord_owed", "ord_retrying"} {
+		var event store.StatusEvent
+		w.DB.First(&event, "order_id = ?", order)
+		if event.NotifySkippedAt != nil {
+			t.Errorf("%s was closed during the gap", order)
+		}
+	}
+
+	if err := store.SetWebhook(w.DB, id, r.URL, sealPrefix+"new-secret"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	w.sweep(context.Background())
+	if got := r.received.Load(); got != 2 {
+		t.Errorf("%d delivered after the new URL, want 2", got)
+	}
+}
+
+// Events that happen while there is no webhook are the polling case, and are
+// closed as before.
+func TestEventsDuringTheGapAreClosed(t *testing.T) {
+	r := newReceiver(t)
+	w := integratorWorker(t, "", "")
+	id := addIntegrator(t, w.DB, "A", r.URL, "secret-a")
+	if err := store.ClearWebhook(w.DB, id, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	owe(t, w.DB, id, "ord_gap")
+
+	w.sweep(context.Background())
+
+	var event store.StatusEvent
+	w.DB.First(&event, "order_id = ?", "ord_gap")
+	if event.NotifySkippedAt == nil {
+		t.Error("an event from the gap stayed owed")
+	}
+}
+
+// A webhook cleared for good must not leave reports open for ever.
+func TestOwedReportsCloseAfterTheGrace(t *testing.T) {
+	r := newReceiver(t)
+	w := integratorWorker(t, "", "")
+	id := addIntegrator(t, w.DB, "A", r.URL, "secret-a")
+	owe(t, w.DB, id, "ord_old")
+	if err := store.ClearWebhook(w.DB, id, time.Now().UTC().Add(-25*time.Hour)); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	w.DB.Model(&store.StatusEvent{}).Where("order_id = ?", "ord_old").Update("at", time.Now().UTC().Add(-26*time.Hour))
+
+	w.sweep(context.Background())
+
+	owed, err := store.OwedIntegrators(w.DB, time.Now().UTC())
+	if err != nil || len(owed) != 0 {
+		t.Errorf("owed = %v, %v", owed, err)
+	}
+}

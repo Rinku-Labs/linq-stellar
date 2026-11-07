@@ -53,6 +53,10 @@ var (
 	// again, whoever holds a leaked key could mint a fresh one and outlive the
 	// rotation meant to shut them out.
 	ErrKeyNotRotatable = errors.New("store: api key cannot be rotated")
+	// ErrLegacyIntegrator refuses a key for Linq-B2B. All its orders belong to
+	// LegacyIntegratorID, so a /v1 key there would read every one of them and
+	// share their idempotency keys. It uses ORDERS_API_KEY.
+	ErrLegacyIntegrator = errors.New("store: this integrator cannot hold issued keys")
 )
 
 // Integrator is a business calling the public API. It is not Order.BusinessID,
@@ -64,6 +68,8 @@ type Integrator struct {
 	// WebhookURL and WebhookSecretEncrypted are unused until signed webhooks.
 	WebhookURL             string `json:"-"`
 	WebhookSecretEncrypted string `json:"-"`
+	// WebhookClearedAt is when the webhook was last cleared. See SkipOwedEvents.
+	WebhookClearedAt *time.Time `json:"-"`
 	// AllowFailureInjection is for Linq's own test integrators only.
 	AllowFailureInjection bool `gorm:"not null;default:false" json:"-"`
 	// RateLimitPerMinute overrides DefaultRateLimitPerMinute for each of this
@@ -107,6 +113,9 @@ type CredentialEvent struct {
 	Actor        string    `gorm:"not null" json:"actor"`
 	Note         string    `json:"note,omitempty"`
 	At           time.Time `gorm:"not null" json:"at"`
+	// RejectedMinute limits a dead key to one rejection row a minute; see
+	// RecordRejection. Nil on every other kind of event.
+	RejectedMinute *time.Time `json:"-"`
 }
 
 func (CredentialEvent) TableName() string { return "credential_events" }
@@ -147,6 +156,9 @@ func SetRateLimit(db *gorm.DB, integratorID string, limit *int) error {
 
 // IssueKey creates a key for an integrator and records that it did.
 func IssueKey(db *gorm.DB, integratorID, mode, actor string, now time.Time) (IssuedKey, error) {
+	if integratorID == LegacyIntegratorID {
+		return IssuedKey{}, ErrLegacyIntegrator
+	}
 	var issued IssuedKey
 	err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.First(&Integrator{}, "id = ?", integratorID).Error; err != nil {
@@ -200,6 +212,9 @@ func RotateKey(db *gorm.DB, keyID, mode, actor string, now time.Time) (IssuedKey
 			}
 			return err
 		}
+		if old.IntegratorID == LegacyIntegratorID {
+			return ErrLegacyIntegrator
+		}
 		if old.RevokedAt != nil || old.ReplacedBy != "" || old.Expired(now) {
 			return ErrKeyNotRotatable
 		}
@@ -238,27 +253,61 @@ func RotateKey(db *gorm.DB, keyID, mode, actor string, now time.Time) (IssuedKey
 	return issued, old, nil
 }
 
-// RevokeKey stops a key immediately. Revoking a revoked key changes nothing and
-// is not an error, so it records nothing either.
-func RevokeKey(db *gorm.DB, keyID, actor string, now time.Time) (APIKey, error) {
+// RevokeKey stops a key immediately, along with every key it was rotated to, and
+// returns those. Anyone holding a leaked key can rotate it, so stopping only the
+// key named would leave them its successor. That also stops the owner's new key
+// if they rotated: a new one has to be issued.
+//
+// Revoking a revoked key records nothing for it and is not an error, but its
+// successors are still followed.
+func RevokeKey(db *gorm.DB, keyID, actor string, now time.Time) (APIKey, []string, error) {
 	var key APIKey
+	var also []string
 	err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.First(&key, "id = ?", keyID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrKeyNotFound
-			}
+		var err error
+		key, err = revokeOne(tx, keyID, actor, "", now)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrKeyNotFound
+		}
+		if err != nil {
 			return err
 		}
-		result := tx.Model(&APIKey{}).Where("id = ? AND revoked_at IS NULL", keyID).
-			Update("revoked_at", now)
-		if result.Error != nil || result.RowsAffected == 0 {
-			return result.Error
+		seen := map[string]bool{keyID: true}
+		note := "rotated from revoked key " + keyID
+		for next := key.ReplacedBy; next != "" && !seen[next]; {
+			seen[next] = true
+			successor, err := revokeOne(tx, next, actor, note, now)
+			if err != nil {
+				return err
+			}
+			also = append(also, next)
+			next = successor.ReplacedBy
 		}
-		key.RevokedAt = &now
-		return RecordCredentialEvent(tx, key.IntegratorID, keyID, CredentialRevoked, actor, "", now)
+		return nil
 	})
 	if err != nil {
+		return APIKey{}, nil, err
+	}
+	return key, also, nil
+}
+
+// revokeOne writes before it reads. The update waits for a rotation in flight, so
+// the row read back names any successor it created; rotation in turn refuses a
+// row this update got to first. Reading first would miss that successor.
+func revokeOne(tx *gorm.DB, keyID, actor, note string, now time.Time) (APIKey, error) {
+	result := tx.Model(&APIKey{}).Where("id = ? AND revoked_at IS NULL", keyID).
+		Update("revoked_at", now)
+	if result.Error != nil {
+		return APIKey{}, result.Error
+	}
+	var key APIKey
+	if err := tx.First(&key, "id = ?", keyID).Error; err != nil {
 		return APIKey{}, err
+	}
+	if result.RowsAffected == 1 {
+		if err := RecordCredentialEvent(tx, key.IntegratorID, keyID, CredentialRevoked, actor, note, now); err != nil {
+			return APIKey{}, err
+		}
 	}
 	return key, nil
 }
@@ -320,11 +369,27 @@ func RecordCredentialEvent(db *gorm.DB, integratorID, keyID, action, actor, note
 	}).Error
 }
 
+// RecordRejection records that a revoked or expired key was used, at most once
+// per key, action and minute. This table is append-only and a dead key skips the
+// rate limit, so a row per request would be permanent growth at the caller's pace.
+// The caller logs every use.
+func RecordRejection(db *gorm.DB, key APIKey, action string, now time.Time) error {
+	minute := now.Truncate(time.Minute)
+	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&CredentialEvent{
+		IntegratorID:   key.IntegratorID,
+		KeyID:          key.ID,
+		Action:         action,
+		Actor:          ActorSystem,
+		At:             now,
+		RejectedMinute: &minute,
+	}).Error
+}
+
 // RecordExpiredKeys writes the `expired` row for every key whose expiry has
 // passed and which does not have one yet. Nothing happens at the moment a key
-// expires, so this runs from the worker and again whenever an expired key is
-// refused. The event carries the expiry time rather than the time of the sweep,
-// and idx_credential_events_expired makes it safe for two callers to race.
+// expires, so this runs from the worker, never on a request: it reads every key.
+// The event carries the expiry time rather than the time of the sweep, and
+// idx_credential_events_expired makes it safe for two callers to race.
 func RecordExpiredKeys(db *gorm.DB, now time.Time) (int64, error) {
 	result := db.Exec(`
 		INSERT INTO credential_events (integrator_id, key_id, action, actor, note, at)
@@ -346,9 +411,10 @@ type CredentialEventFilter struct {
 	Limit        int
 }
 
-// ListCredentialEvents returns the newest events first.
+// ListCredentialEvents returns the newest events first, by when they happened:
+// an expired row is written after the fact, carrying the time of the expiry.
 func ListCredentialEvents(db *gorm.DB, f CredentialEventFilter) ([]CredentialEvent, error) {
-	query := db.Order("id DESC").Limit(f.Limit)
+	query := db.Order("at DESC, id DESC").Limit(f.Limit)
 	if f.IntegratorID != "" {
 		query = query.Where("integrator_id = ?", f.IntegratorID)
 	}

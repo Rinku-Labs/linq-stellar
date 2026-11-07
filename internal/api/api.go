@@ -633,8 +633,13 @@ const maxIdempotencyKeyLength = 255
 // both sides of the quote, decides what a deposit is worth: 0.01 USDC against
 // ₦10,000,000 would otherwise be a valid order. A rate is refused rather than
 // ignored so a caller never believes it locked a figure it did not.
+//
+// manualDeposit goes too: it pays for whatever arrives at the locked rate, which
+// would be a free option against Linq, of any size, for the whole deposit window.
 func refuseCallerQuote(r CreateOrderRequest) error {
 	switch {
+	case r.ManualDeposit:
+		return errors.New("manualDeposit is not available on this API")
 	case r.Rate != 0:
 		return errors.New("rate is set by this service; leave it out")
 	case r.AmountNGN > 0 && r.AmountUSDC > 0:
