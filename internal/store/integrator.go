@@ -68,6 +68,8 @@ type Integrator struct {
 	// WebhookURL and WebhookSecretEncrypted are unused until signed webhooks.
 	WebhookURL             string `json:"-"`
 	WebhookSecretEncrypted string `json:"-"`
+	// WebhookClearedAt is when the webhook was last cleared. See SkipOwedEvents.
+	WebhookClearedAt *time.Time `json:"-"`
 	// AllowFailureInjection is for Linq's own test integrators only.
 	AllowFailureInjection bool `gorm:"not null;default:false" json:"-"`
 	// RateLimitPerMinute overrides DefaultRateLimitPerMinute for each of this

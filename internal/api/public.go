@@ -292,12 +292,13 @@ func validLimit(limit *int) bool { return limit == nil || *limit > 0 }
 
 // handleSetWebhook points an integrator's events at a URL. The first URL mints the
 // secret that signs them, shown only in that reply; a later one keeps it, so a
-// move of endpoint does not break the receiver's signature check. An empty url
-// clears both, which is also how a secret is replaced. Linq-B2B is refused: its
-// webhook comes from MERCHANT_WEBHOOK_URL.
+// move of endpoint does not break the receiver's signature check. rotateSecret
+// replaces the secret with no gap in the webhook. An empty url clears both.
+// Linq-B2B is refused: its webhook comes from MERCHANT_WEBHOOK_URL.
 func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		URL string `json:"url"`
+		URL          string `json:"url"`
+		RotateSecret bool   `json:"rotateSecret"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -310,7 +311,11 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.URL == "" {
-		if err := store.SetWebhook(s.DB, id, "", ""); err != nil {
+		if body.RotateSecret {
+			writeError(w, http.StatusBadRequest, "rotateSecret needs a url")
+			return
+		}
+		if err := store.ClearWebhook(s.DB, id, s.now()); err != nil {
 			s.writeCredentialError(w, "clear the webhook", err)
 			return
 		}
@@ -328,7 +333,7 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		s.writeCredentialError(w, "load the webhook", err)
 		return
 	}
-	if existing != "" {
+	if existing != "" && !body.RotateSecret {
 		if err := store.SetWebhookURL(s.DB, id, body.URL); err != nil {
 			s.writeCredentialError(w, "set the webhook", err)
 			return
