@@ -122,6 +122,49 @@ sweep or a refund, resending moves money twice.
 Fee bumps are exempt — a fee account does not spend a sequence number — which is
 why `FeeBumpAndSubmit` submits directly.
 
+## Integrators, keys and rate limits
+
+`/v1` and `/admin` live in `internal/api/public.go` and are only served when
+`PUBLIC_API_ENABLED=true`. `/v1/orders` runs the same handlers as `/orders`; the
+caller comes from the request context, so the two cannot drift apart.
+
+- **An integrator is the caller; `Order.BusinessID` is the merchant.** Do not
+  reuse one for the other. Every order query a caller can reach filters on
+  `integrator_id`. `ORDERS_API_KEY` maps to `store.LegacyIntegratorID`, which is
+  also the column default, so a row written without one belongs to Linq-B2B.
+- **An issued key never sets the rate.** Settlement pays `QuotedNGN` once
+  `QuotedUSDC` arrives, so whoever sets the rate decides what a deposit is
+  worth: 0.01 USDC against ₦10,000,000 passes every other check. On `/v1` a
+  `rate`, or both amounts, is a 400; the rate comes from `Server.Rates`
+  (`GET /b2b/rate` on the Linq backend, held `payout.RateMaxAge`). No rate
+  means no order: never fall back to a stale or supplied one. Only the legacy
+  key sends a rate, which Linq-B2B fetches from that same route.
+  `manualDeposit` is legacy-only for the same reason: it pays for whatever
+  arrives at the locked rate.
+- **A key is never stored or logged.** Only `key_prefix` and a SHA-256 of the
+  whole key. `writeIssuedKey` is the one place a full key leaves the service.
+- **`credential_events` is the rotation and revocation proof, and a Postgres
+  trigger makes it append-only.** Any new way to
+  change a key must write a row there, in the same transaction as the change.
+- **A key inside its rotation overlap cannot rotate again.** Otherwise a leaked
+  key could mint a successor and outlive the rotation.
+- **Revoking a key revokes everything it rotated to.** A leaked key can rotate
+  once, so its successor is just as compromised.
+- **`linq-b2b` cannot hold an issued key.** All its orders are under that one
+  integrator, so a key there would read every one of them.
+- **Rejected keys write one row per key, action and minute, and log every use.**
+  They skip the rate limit and `credential_events` can't be cleaned up, so never
+  write a row per request or scan on the request path.
+- **The limit is counted after authentication, by key, never by address.**
+  Counting first would let anyone who has seen a prefix lock its owner out. The
+  legacy routes have no key row, so they carry no limit.
+- **The counter is one atomic upsert per request** (`HitRateCounter`), in
+  Postgres so it holds across instances. A read then a write would let
+  concurrent requests through. If it cannot be written the request gets 503: the
+  limit never silently stops applying.
+- **`rate limit refused` log lines are the proof of enforcement.** Counter rows
+  are gone within the hour, so nothing else records a refusal.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every

@@ -22,9 +22,13 @@ type Order struct {
 	ID string `gorm:"primaryKey" json:"id"`
 	// BusinessID is the merchant being settled to.
 	BusinessID uint `gorm:"index" json:"businessId"`
+	// IntegratorID is the caller that created this order, which is not the
+	// merchant in BusinessID. An order is only ever visible to its integrator.
+	IntegratorID string `gorm:"not null;default:int_linq_b2b;uniqueIndex:idx_orders_integrator_idempotency,priority:1" json:"integratorId"`
 	// IdempotencyKey is supplied by the integrator. Two creates with the same
-	// key return the same order rather than minting a second deposit account.
-	IdempotencyKey string `gorm:"uniqueIndex;size:255" json:"idempotencyKey"`
+	// key from the same integrator return the same order rather than minting a
+	// second deposit account. Two integrators may use the same key.
+	IdempotencyKey string `gorm:"uniqueIndex:idx_orders_integrator_idempotency,priority:2;size:255" json:"idempotencyKey"`
 	// CustomerRef is the integrator's own reference. It is surfaced to the payer
 	// in the SEP-7 memo, so it must stay short and free of anything private.
 	CustomerRef string `json:"customerRef"`
