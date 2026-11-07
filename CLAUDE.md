@@ -139,6 +139,8 @@ caller comes from the request context, so the two cannot drift apart.
   (`GET /b2b/rate` on the Linq backend, held `payout.RateMaxAge`). No rate
   means no order: never fall back to a stale or supplied one. Only the legacy
   key sends a rate, which Linq-B2B fetches from that same route.
+  `manualDeposit` is legacy-only for the same reason: it pays for whatever
+  arrives at the locked rate.
 - **A key is never stored or logged.** Only `key_prefix` and a SHA-256 of the
   whole key. `writeIssuedKey` is the one place a full key leaves the service.
 - **`credential_events` is the rotation and revocation proof, and a Postgres
@@ -146,6 +148,13 @@ caller comes from the request context, so the two cannot drift apart.
   change a key must write a row there, in the same transaction as the change.
 - **A key inside its rotation overlap cannot rotate again.** Otherwise a leaked
   key could mint a successor and outlive the rotation.
+- **Revoking a key revokes everything it rotated to.** A leaked key can rotate
+  once, so its successor is just as compromised.
+- **`linq-b2b` cannot hold an issued key.** All its orders are under that one
+  integrator, so a key there would read every one of them.
+- **Rejected keys write one row per key, action and minute, and log every use.**
+  They skip the rate limit and `credential_events` can't be cleaned up, so never
+  write a row per request or scan on the request path.
 - **The limit is counted after authentication, by key, never by address.**
   Counting first would let anyone who has seen a prefix lock its owner out. The
   legacy routes have no key row, so they carry no limit.

@@ -25,6 +25,10 @@ const dueNow = `(notify_after IS NULL OR notify_after <= ?)`
 // answer a dispute about a missed notification.
 const webhookDeliveryRetention = 90 * 24 * time.Hour
 
+// webhookClearGrace is how long reports owed when a webhook was cleared wait for a
+// new URL before they are closed.
+const webhookClearGrace = 24 * time.Hour
+
 // pruneBatch keeps each delete short, so pruning never holds a long lock.
 const pruneBatch = 5000
 
@@ -72,7 +76,10 @@ func PruneWebhookDeliveries(db *gorm.DB, now time.Time) (int64, error) {
 
 // SetWebhookURL moves an integrator's events to a new URL, keeping its secret.
 func SetWebhookURL(db *gorm.DB, integratorID, url string) error {
-	result := db.Model(&Integrator{}).Where("id = ?", integratorID).Update("webhook_url", url)
+	result := db.Model(&Integrator{}).Where("id = ?", integratorID).Updates(map[string]any{
+		"webhook_url":        url,
+		"webhook_cleared_at": nil,
+	})
 	if result.Error != nil {
 		return result.Error
 	}
@@ -83,11 +90,21 @@ func SetWebhookURL(db *gorm.DB, integratorID, url string) error {
 }
 
 // SetWebhook sets where an integrator's events go and the sealed secret that
-// signs them. Empty values clear both.
+// signs them.
 func SetWebhook(db *gorm.DB, integratorID, url, sealedSecret string) error {
+	return updateWebhook(db, integratorID, url, sealedSecret, nil)
+}
+
+// ClearWebhook removes an integrator's webhook and secret, noting when.
+func ClearWebhook(db *gorm.DB, integratorID string, now time.Time) error {
+	return updateWebhook(db, integratorID, "", "", &now)
+}
+
+func updateWebhook(db *gorm.DB, integratorID, url, sealedSecret string, clearedAt *time.Time) error {
 	result := db.Model(&Integrator{}).Where("id = ?", integratorID).Updates(map[string]any{
 		"webhook_url":              url,
 		"webhook_secret_encrypted": sealedSecret,
+		"webhook_cleared_at":       clearedAt,
 	})
 	if result.Error != nil {
 		return result.Error
@@ -138,10 +155,21 @@ func OwedEventsFor(db *gorm.DB, integratorID string, now time.Time, limit int) (
 // SkipOwedEvents closes the reports of an integrator with no webhook. It polls
 // instead, so nothing is owed, and leaving them open would have every pass read
 // them again for as long as the integrator exists.
+//
+// A report that was already owed when the webhook was cleared is another matter:
+// the integrator was expecting it, and may be about to set a new URL. Those stay
+// open for webhookClearGrace, so clearing a webhook never loses one by itself.
 func SkipOwedEvents(db *gorm.DB, integratorID string, now time.Time) error {
-	return db.Model(&StatusEvent{}).Where(owedEvents).
-		Where("order_id IN (SELECT id FROM stellar_orders WHERE integrator_id = ?)", integratorID).
-		Update("notify_skipped_at", now).Error
+	var integrator Integrator
+	if err := db.Select("webhook_cleared_at").First(&integrator, "id = ?", integratorID).Error; err != nil {
+		return err
+	}
+	query := db.Model(&StatusEvent{}).Where(owedEvents).
+		Where("order_id IN (SELECT id FROM stellar_orders WHERE integrator_id = ?)", integratorID)
+	if cleared := integrator.WebhookClearedAt; cleared != nil && now.Sub(*cleared) < webhookClearGrace {
+		query = query.Where("at >= ?", *cleared)
+	}
+	return query.Update("notify_skipped_at", now).Error
 }
 
 // publicReasons is what an integrator is told when an order moved for a reason.

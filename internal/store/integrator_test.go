@@ -234,7 +234,7 @@ func TestOnlyOneConcurrentRotationWins(t *testing.T) {
 	open := postgresSchema(t)
 	db := open()
 	now := time.Now().UTC()
-	key, err := IssueKey(db, LegacyIntegratorID, "live", ActorAdmin, now)
+	key, err := IssueKey(db, testIntegrator(t, db), "live", ActorAdmin, now)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestOnlyOneConcurrentRotationWins(t *testing.T) {
 func TestRotationNeverExtendsAnExpiry(t *testing.T) {
 	db := poolDB(t)
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
-	key, err := IssueKey(db, LegacyIntegratorID, "live", ActorAdmin, now)
+	key, err := IssueKey(db, testIntegrator(t, db), "live", ActorAdmin, now)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestRotationNeverExtendsAnExpiry(t *testing.T) {
 func TestLastUsedIsRecordedCoarsely(t *testing.T) {
 	db := poolDB(t)
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
-	issued, err := IssueKey(db, LegacyIntegratorID, "live", ActorAdmin, now)
+	issued, err := IssueKey(db, testIntegrator(t, db), "live", ActorAdmin, now)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -429,6 +429,15 @@ func TestPruneDeletesCountersOlderThanAnHour(t *testing.T) {
 
 // Server and worker migrate at startup, so a deploy runs this concurrently on a
 // schema that has work to do.
+func testIntegrator(t *testing.T, db *gorm.DB) string {
+	t.Helper()
+	integrator, err := CreateIntegrator(db, "test", nil)
+	if err != nil {
+		t.Fatalf("create integrator: %v", err)
+	}
+	return integrator.ID
+}
+
 func TestConcurrentMigrationsDoNotCollide(t *testing.T) {
 	if os.Getenv("LINQ_TEST_PG_DSN") == "" {
 		t.Skip("needs LINQ_TEST_PG_DSN")
