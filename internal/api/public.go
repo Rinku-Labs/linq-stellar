@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Rinku-Labs/linq-stellar/docs"
 	"github.com/Rinku-Labs/linq-stellar/internal/apikey"
 	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
@@ -70,6 +71,11 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/orders", s.requireIntegratorKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /v1/orders/{id}", s.requireIntegratorKey(s.handleOrderStatus))
 	mux.HandleFunc("POST /v1/keys/rotate", s.requireIntegratorKey(s.handleRotateOwnKey))
+
+	mux.HandleFunc("GET /docs", s.handleDocs)
+	mux.HandleFunc("GET /docs/{$}", s.handleDocs)
+	mux.HandleFunc("GET /docs/README.md", serveDocFile("text/markdown; charset=utf-8", docs.Guide))
+	mux.HandleFunc("GET /docs/openapi.yaml", serveDocFile("application/yaml; charset=utf-8", docs.OpenAPI))
 
 	mux.HandleFunc("POST /admin/integrators", s.requireAdminKey(s.handleCreateIntegrator))
 	mux.HandleFunc("PUT /admin/integrators/{id}/rate-limit", s.requireAdminKey(s.handleSetRateLimit))

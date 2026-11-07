@@ -162,6 +162,8 @@ caller comes from the request context, so the two cannot drift apart.
   Postgres so it holds across instances. A read then a write would let
   concurrent requests through. If it cannot be written the request gets 503: the
   limit never silently stops applying.
+- **`docs/api/` is held to the code by `internal/api/docs_test.go`.** A new `/v1`
+  route, reply field or status fails there until it is documented.
 - **`rate limit refused` log lines are the proof of enforcement.** Counter rows
   are gone within the hour, so nothing else records a refusal.
 
