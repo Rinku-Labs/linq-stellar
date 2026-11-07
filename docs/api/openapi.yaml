@@ -1,0 +1,337 @@
+openapi: 3.0.3
+info:
+  title: Linq Settlement API
+  version: 1.0.0
+  description: |
+    Take USDC on Stellar and pay naira to a Nigerian bank account.
+    Guides are at /docs.
+servers:
+  - url: /
+    description: The host serving this file.
+security:
+  - apiKey: []
+tags:
+  - name: Orders
+  - name: Keys
+paths:
+  /v1/orders:
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Send one of amountNgn or amountUsdc, and no rate. Linq sets the rate and
+        returns the one it used. Sending an idempotencyKey again returns the
+        original order with 200, without comparing the rest of the request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              fromNaira:
+                summary: Pay the bank an exact naira amount
+                value:
+                  idempotencyKey: invoice-1042
+                  amountNgn: 15000
+                  bankCode: '058'
+                  bankAccount: '0123456789'
+                  accountName: Ada Stores Ltd
+              fromUsdc:
+                summary: Convert an exact USDC amount
+                value:
+                  idempotencyKey: invoice-1043
+                  amountUsdc: 10
+                  bankCode: '058'
+                  bankAccount: '0123456789'
+      responses:
+        '200':
+          description: This idempotencyKey was already used. The original order.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '201':
+          description: The order was created.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/orders/{id}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get an order
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: The order id from creation.
+      responses:
+        '200':
+          description: The order.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: No such order on your account. Other accounts' orders are also 404.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/keys/rotate:
+    post:
+      tags: [Keys]
+      operationId: rotateKey
+      summary: Replace the key making this request
+      description: |
+        Returns a new key, shown only this once. The old key keeps working for
+        24 hours.
+      responses:
+        '201':
+          description: The new key.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RotatedKey' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: This key was already rotated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  headers:
+    RateLimitLimit:
+      description: Requests this key may make per clock minute.
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Requests left this minute.
+      schema: { type: integer }
+    RetryAfter:
+      description: Seconds until the next minute starts.
+      schema: { type: integer }
+  responses:
+    BadRequest:
+      description: The request is invalid. message says why.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: 'rate is set by this service; leave it out' }
+    Unauthorized:
+      description: The key is missing, wrong, revoked or expired.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: invalid or missing X-API-Key }
+    Forbidden:
+      description: This account is suspended.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: this integrator is suspended }
+    TooManyRequests:
+      description: Over the rate limit.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: 'rate limit exceeded; see Retry-After' }
+    ServerError:
+      description: Something went wrong at Linq. Retry with the same idempotencyKey.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: Linq can't check the key, or can't price or prepare the order, right now. Retry shortly.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { message: 'could not get the current rate right now; try again shortly' }
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+    CreateOrderRequest:
+      type: object
+      description: Send exactly one of amountNgn or amountUsdc.
+      required: [idempotencyKey, bankCode, bankAccount]
+      properties:
+        idempotencyKey:
+          type: string
+          maxLength: 255
+          description: Unique to you. One per order you mean to create.
+        amountNgn:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          description: The bank receives exactly this, in naira.
+        amountUsdc:
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          description: USDC the payer will send, rounded up to two decimals.
+        bankCode: { type: string, description: The recipient bank's code. }
+        bankAccount: { type: string, description: The recipient account number. }
+        accountName: { type: string }
+        bankName: { type: string }
+        currency: { type: string, default: NGN }
+        businessId:
+          type: integer
+          minimum: 0
+          description: Your own id for the merchant. Stored, not returned.
+        customerRef:
+          type: string
+          description: Your reference. Becomes the memo in paymentUri, so keep it to 28 bytes.
+        refundAddress:
+          type: string
+          description: Stellar account for a refund. Must be able to receive USDC. Defaults to the account that paid.
+    Order:
+      type: object
+      required:
+        - id
+        - status
+        - depositAddress
+        - amountUsdc
+        - amountNgn
+        - quotedUsdc
+        - quotedNgn
+        - rate
+        - feeUsdc
+        - currency
+        - assetCode
+        - assetIssuer
+        - depositDeadline
+        - createdAt
+        - updatedAt
+      properties:
+        id: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        depositAddress: { type: string, description: The Stellar account to pay. }
+        amountUsdc: { type: number, description: 'Equals quotedUsdc until a deposit arrives, then what was received.' }
+        amountNgn: { type: number, description: 'Equals quotedNgn until a deposit arrives, then what is being paid.' }
+        quotedUsdc: { type: number, description: What the payer was asked to send. Never changes. }
+        quotedNgn: { type: number, description: What the order was created for. Never changes. }
+        rate: { type: number, description: 'Naira per USDC, set by Linq when the order was created.' }
+        feeUsdc: { type: number }
+        currency: { type: string }
+        assetCode: { type: string, example: USDC }
+        assetIssuer: { type: string, description: Issuer of the asset to pay with. }
+        depositDeadline: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        paymentUri: { type: string, description: SEP-7 link for a wallet. Absent once the order is final. }
+        depositTxHash: { type: string }
+        sweepTxHash: { type: string }
+        payoutReference: { type: string, description: Identifies the bank transfer. }
+        refundTxHash: { type: string }
+        refundDestination: { type: string, description: 'Where a refund would go, or went.' }
+        underpaid: { type: boolean, description: Present and true only when the deposit fell short of the quote. }
+        shortfallNgn: { type: number, description: Present with underpaid. }
+        statusHistory:
+          type: array
+          items: { $ref: '#/components/schemas/StatusEvent' }
+        statusHistorySeconds: { type: number, description: Seconds between the first and last entry in statusHistory. }
+        statusReason: { type: string, description: 'A fixed message, present after a payout failed. Contact Linq for the specific cause.' }
+    OrderStatus:
+      type: string
+      enum:
+        - initiated
+        - awaiting_deposit
+        - deposit_detected
+        - payout_queued
+        - payout_processing
+        - disbursed
+        - sweep_queued
+        - sweep_processing
+        - settled_in_treasury
+        - refund_queued
+        - refund_processing
+        - refunded
+        - expired
+        - failed
+    StatusEvent:
+      type: object
+      required: [kind, to, at]
+      properties:
+        kind:
+          type: string
+          enum: [transition, notification]
+          description: A status change, or an attempt to report one.
+        from: { type: string }
+        to: { type: string }
+        reason: { type: string }
+        at: { type: string, format: date-time }
+        notifiedAt: { type: string, format: date-time, description: When this move was reported to your webhook. }
+    WebhookEvent:
+      type: object
+      description: The body of a webhook delivery. Fields with nothing to report are left out.
+      required: [event, orderId, status, amountNGN, amountStableCoin, occurredAt, timestamp]
+      properties:
+        event: { type: string, example: order.disbursed }
+        orderId: { type: string }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        amountNGN: { type: number }
+        amountStableCoin: { type: number, description: USDC. }
+        txHash: { type: string, description: The deposit transaction. }
+        underpaid: { type: boolean }
+        shortfallNgn: { type: number }
+        quotedNgn: { type: number }
+        quotedStableCoin: { type: number, description: USDC. }
+        payoutReference: { type: string }
+        refundTxHash: { type: string }
+        sweepTxHash: { type: string }
+        depositAddress: { type: string }
+        refundDestination: { type: string }
+        reason: { type: string, description: 'A fixed message, present after a payout failed.' }
+        occurredAt: { type: string, format: date-time, description: When the order moved. }
+        timestamp: { type: string, format: date-time, description: When this attempt was sent. }
+    RotatedKey:
+      type: object
+      required: [id, integratorId, keyPrefix, key, createdAt, previousKey]
+      properties:
+        id: { type: string }
+        integratorId: { type: string }
+        keyPrefix: { type: string }
+        key: { type: string, description: The full key. Shown only this once. }
+        createdAt: { type: string, format: date-time }
+        previousKey:
+          type: object
+          required: [id, expiresAt]
+          properties:
+            id: { type: string }
+            expiresAt: { type: string, format: date-time }
