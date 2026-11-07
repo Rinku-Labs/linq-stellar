@@ -292,10 +292,10 @@ func TestFailureStatesAreReportable(t *testing.T) {
 	}
 }
 
-// With no URL the worker stands down rather than spinning.
-func TestDisabledWithoutURL(t *testing.T) {
+// With no URL the loop still runs for integrators, and stops when told to.
+func TestRunsWithoutURLUntilCancelled(t *testing.T) {
 	w := newWorker(t, "", "")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	done := make(chan struct{})
@@ -304,7 +304,7 @@ func TestDisabledWithoutURL(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("Run did not return with no URL configured")
+		t.Fatal("Run did not stop when cancelled")
 	}
 }
 

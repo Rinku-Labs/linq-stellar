@@ -506,3 +506,25 @@ func TestStatusAndActionAreConstrained(t *testing.T) {
 		t.Error("an unknown credential action was recorded")
 	}
 }
+
+func TestOldDeliveriesArePrunedAndRecentOnesKept(t *testing.T) {
+	engines(t, func(t *testing.T, open func() *gorm.DB) {
+		db := open()
+		now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+		for _, at := range []time.Time{now.Add(-91 * 24 * time.Hour), now.Add(-89 * 24 * time.Hour)} {
+			row := WebhookDelivery{OrderID: "o", IntegratorID: "i", Status: "disbursed", Attempt: 1, URLHost: "h", At: at}
+			if err := RecordWebhookDelivery(db, row); err != nil {
+				t.Fatalf("record: %v", err)
+			}
+		}
+		deleted, err := PruneWebhookDeliveries(db, now)
+		if err != nil || deleted != 1 {
+			t.Fatalf("deleted = %d, %v", deleted, err)
+		}
+		var left int64
+		db.Model(&WebhookDelivery{}).Count(&left)
+		if left != 1 {
+			t.Errorf("%d rows left, want 1", left)
+		}
+	})
+}
