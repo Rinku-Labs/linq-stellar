@@ -86,6 +86,14 @@ The other admin routes are `PUT /admin/integrators/{id}/rate-limit`
 `GET /admin/credential-events` (`integratorId`, `keyId`, `limit`). Rate limit
 refusals are logged as `rate limit refused` with the key ID and time.
 
+Revoking a key also revokes every key it was rotated to, because whoever holds a
+leaked key can rotate it. The reply lists them in `alsoRevoked`, and the owner
+then needs a newly issued key. `linq-b2b` can't hold issued keys.
+
+**Don't turn `PUBLIC_API_ENABLED` on before SD-3 is deployed.** Until then every
+integrator's order events go to `MERCHANT_WEBHOOK_URL`, and `/v1` shows raw
+failure reasons.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 

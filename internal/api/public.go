@@ -127,11 +127,6 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (store.API
 		writeError(w, http.StatusUnauthorized, "this key has been revoked")
 		return store.APIKey{}, false
 	case key.Expired(now):
-		// The worker may not have reached this one yet, and the proof should
-		// read expired-then-rejected.
-		if _, err := store.RecordExpiredKeys(s.DB, now); err != nil {
-			s.Log.Error("could not record expired keys", "error", err)
-		}
 		s.recordRejection(key, store.CredentialRejectedExpired, now)
 		writeError(w, http.StatusUnauthorized, "this key has expired")
 		return store.APIKey{}, false
@@ -147,8 +142,9 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (store.API
 }
 
 func (s *Server) recordRejection(key store.APIKey, action string, now time.Time) {
-	err := store.RecordCredentialEvent(s.DB, key.IntegratorID, key.ID, action, store.ActorSystem, "", now)
-	if err != nil {
+	// Every use is logged. The table keeps one row a minute; see RecordRejection.
+	s.Log.Info("rejected key used", "integrator", key.IntegratorID, "key", key.ID, "action", action)
+	if err := store.RecordRejection(s.DB, key, action, now); err != nil {
 		s.Log.Error("could not record a rejected key", "key", key.ID, "action", action, "error", err)
 	}
 }
@@ -302,16 +298,17 @@ func (s *Server) handleIssueKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
-	key, err := store.RevokeKey(s.DB, r.PathValue("id"), store.ActorAdmin, s.now())
+	key, also, err := store.RevokeKey(s.DB, r.PathValue("id"), store.ActorAdmin, s.now())
 	if err != nil {
 		s.writeCredentialError(w, "revoke the key", err)
 		return
 	}
-	s.Log.Info("api key revoked", "integrator", key.IntegratorID, "key", key.ID)
+	s.Log.Info("api key revoked", "integrator", key.IntegratorID, "key", key.ID, "alsoRevoked", also)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":           key.ID,
 		"integratorId": key.IntegratorID,
 		"revokedAt":    key.RevokedAt,
+		"alsoRevoked":  also,
 	})
 }
 
@@ -361,6 +358,8 @@ func (s *Server) writeCredentialError(w http.ResponseWriter, action string, err 
 		writeError(w, http.StatusNotFound, "integrator not found")
 	case errors.Is(err, store.ErrKeyNotFound):
 		writeError(w, http.StatusNotFound, "key not found")
+	case errors.Is(err, store.ErrLegacyIntegrator):
+		writeError(w, http.StatusConflict, "this integrator uses the shared key and cannot hold issued keys")
 	case errors.Is(err, store.ErrKeyNotRotatable):
 		writeError(w, http.StatusConflict, "this key is revoked, expired or already rotated")
 	default:
