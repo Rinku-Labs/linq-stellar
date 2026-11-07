@@ -11,10 +11,32 @@ import "gorm.io/gorm"
 // reference it sent. Nothing else — this service does not
 // own merchant records or bank details beyond what it needs to settle one
 // payment.
+//
+// Server and worker both migrate at startup, and two CREATE TABLEs for the same
+// table collide in Postgres's catalog even with IF NOT EXISTS. So the whole of it
+// runs in one transaction behind an advisory lock: the second instance waits, then
+// finds nothing left to do. DDL is transactional in Postgres, so a failure leaves
+// no half-applied schema either. A statement that cannot run in a transaction,
+// such as CREATE INDEX CONCURRENTLY, does not belong in here.
 func Migrate(db *gorm.DB) error {
+	if db.Dialector.Name() != "postgres" {
+		return migrate(db)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLock).Error; err != nil {
+			return err
+		}
+		return migrate(tx)
+	})
+}
+
+// migrationLock is an arbitrary number shared by everything that migrates.
+const migrationLock = 7283945
+
+func migrate(db *gorm.DB) error {
 	if err := db.AutoMigrate(
 		&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{},
-		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{},
+		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{}, &WebhookDelivery{},
 		&PayoutAttempt{},
 	); err != nil {
 		return err
@@ -37,9 +59,6 @@ func Migrate(db *gorm.DB) error {
 // protectCredentialEvents makes the rotation and revocation proof append-only:
 // a row anyone could quietly edit would prove nothing. Postgres only; the tests'
 // SQLite has no such trigger.
-//
-// The advisory lock is here because server and worker both migrate at startup,
-// and two concurrent CREATE OR REPLACE FUNCTION calls can fail outright.
 func protectCredentialEvents(db *gorm.DB) error {
 	if db.Dialector.Name() != "postgres" {
 		return nil
@@ -47,7 +66,6 @@ func protectCredentialEvents(db *gorm.DB) error {
 	return db.Exec(`
 		DO $migrate$
 		BEGIN
-			PERFORM pg_advisory_xact_lock(7283945);
 			CREATE OR REPLACE FUNCTION credential_events_append_only() RETURNS trigger AS $fn$
 			BEGIN
 				RAISE EXCEPTION 'credential_events is append-only';
@@ -102,10 +120,20 @@ func createWorkerIndexes(db *gorm.DB) error {
 		   ON stellar_deposit_pool (id)
 		   WHERE claimed_at IS NULL AND ready = true`,
 
+		// One rejection row per key, action and minute. See RecordRejection.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_events_rejected
+		   ON credential_events (key_id, action, rejected_minute)
+		   WHERE rejected_minute IS NOT NULL`,
+
 		// One `expired` row per key, however many callers notice it.
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_events_expired
 		   ON credential_events (key_id)
 		   WHERE action = 'expired'`,
+
+		// The notifier's every pass. See owedEvents.
+		`CREATE INDEX IF NOT EXISTS idx_status_events_owed
+		   ON stellar_order_status_events (at, id)
+		   WHERE ` + owedEvents,
 
 		// Pruning: counters are keyed by key first, so the delete by age needs
 		// its own path.

@@ -256,7 +256,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	ownQuote := callerOf(r).namesOwnRate()
+	ownQuote := callerOf(r).legacy()
 	if !ownQuote {
 		if err := refuseCallerQuote(req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -273,7 +273,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	var existing store.Order
 	err := s.DB.Omit("encrypted_seed").Where("integrator_id = ? AND idempotency_key = ?", integratorID(r), req.IdempotencyKey).First(&existing).Error
 	if err == nil {
-		s.writeOrder(w, http.StatusOK, &existing)
+		s.writeOrder(w, r, http.StatusOK, &existing)
 		return
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -403,7 +403,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	// looking at the address and may already have sent to it.
 	s.Wake.Signal(wake.Deposits)
 
-	s.writeOrder(w, http.StatusCreated, &order)
+	s.writeOrder(w, r, http.StatusCreated, &order)
 }
 
 func (s *Server) currentRate() (float64, error) {
@@ -495,8 +495,8 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
-	if callerOf(r).keyID == "" { // the legacy shared key
-		s.writeOrder(w, http.StatusOK, &order)
+	if callerOf(r).legacy() {
+		s.writeOrder(w, r, http.StatusOK, &order)
 		return
 	}
 	// /v1 also lists every payout reference used, so an integrator can see a
@@ -508,7 +508,7 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	if attempts == nil {
 		attempts = []store.PayoutAttempt{}
 	}
-	s.writeOrderWith(w, http.StatusOK, &order, map[string]any{"payoutAttempts": attempts})
+	s.writeOrderWith(w, r, http.StatusOK, &order, map[string]any{"payoutAttempts": attempts})
 }
 
 // writeOrder renders an order along with the SEP-7 URI a wallet can scan.
@@ -517,12 +517,12 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 // knows the destination, asset, amount and memo. A frontend that assembled it
 // would be reconstructing facts it had to be told, and would be the second
 // place a wrong asset issuer could creep in.
-func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
-	s.writeOrderWith(w, status, o, nil)
+func (s *Server) writeOrder(w http.ResponseWriter, r *http.Request, status int, o *store.Order) {
+	s.writeOrderWith(w, r, status, o, nil)
 }
 
 // writeOrderWith is writeOrder with extra fields added to the body.
-func (s *Server) writeOrderWith(w http.ResponseWriter, status int, o *store.Order, extra map[string]any) {
+func (s *Server) writeOrderWith(w http.ResponseWriter, r *http.Request, status int, o *store.Order, extra map[string]any) {
 	payload := map[string]any{
 		"id":             o.ID,
 		"status":         o.Status,
@@ -587,6 +587,9 @@ func (s *Server) writeOrderWith(w http.ResponseWriter, status int, o *store.Orde
 	if events, err := store.StatusHistory(s.DB, o.ID); err != nil {
 		s.Log.Warn("could not load status history", "order", o.ID, "error", err)
 	} else if len(events) > 0 {
+		if !callerOf(r).legacy() {
+			usePublicReasons(events)
+		}
 		payload["statusHistory"] = events
 		first, last := events[0].At, events[len(events)-1].At
 		payload["statusHistorySeconds"] = last.Sub(first).Seconds()
@@ -630,8 +633,13 @@ const maxIdempotencyKeyLength = 255
 // both sides of the quote, decides what a deposit is worth: 0.01 USDC against
 // ₦10,000,000 would otherwise be a valid order. A rate is refused rather than
 // ignored so a caller never believes it locked a figure it did not.
+//
+// manualDeposit goes too: it pays for whatever arrives at the locked rate, which
+// would be a free option against Linq, of any size, for the whole deposit window.
 func refuseCallerQuote(r CreateOrderRequest) error {
 	switch {
+	case r.ManualDeposit:
+		return errors.New("manualDeposit is not available on this API")
 	case r.Rate != 0:
 		return errors.New("rate is set by this service; leave it out")
 	case r.AmountNGN > 0 && r.AmountUSDC > 0:
@@ -801,6 +809,16 @@ func refundDestination(o *store.Order) string {
 		return o.RefundAddress
 	}
 	return o.DepositFrom
+}
+
+// usePublicReasons replaces each move's stored reason with what an integrator may
+// see. Notification rows stay: they describe deliveries to its own endpoint.
+func usePublicReasons(events []store.StatusEvent) {
+	for i := range events {
+		if events[i].Kind == store.KindTransition {
+			events[i].Reason = store.PublicReason(events[i].To, events[i].Reason)
+		}
+	}
 }
 
 // latestReason returns the explanation attached to this order's most recent

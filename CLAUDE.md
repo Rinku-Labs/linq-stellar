@@ -139,6 +139,8 @@ caller comes from the request context, so the two cannot drift apart.
   (`GET /b2b/rate` on the Linq backend, held `payout.RateMaxAge`). No rate
   means no order: never fall back to a stale or supplied one. Only the legacy
   key sends a rate, which Linq-B2B fetches from that same route.
+  `manualDeposit` is legacy-only for the same reason: it pays for whatever
+  arrives at the locked rate.
 - **A key is never stored or logged.** Only `key_prefix` and a SHA-256 of the
   whole key. `writeIssuedKey` is the one place a full key leaves the service.
 - **`credential_events` is the rotation and revocation proof, and a Postgres
@@ -146,6 +148,13 @@ caller comes from the request context, so the two cannot drift apart.
   change a key must write a row there, in the same transaction as the change.
 - **A key inside its rotation overlap cannot rotate again.** Otherwise a leaked
   key could mint a successor and outlive the rotation.
+- **Revoking a key revokes everything it rotated to.** A leaked key can rotate
+  once, so its successor is just as compromised.
+- **`linq-b2b` cannot hold an issued key.** All its orders are under that one
+  integrator, so a key there would read every one of them.
+- **Rejected keys write one row per key, action and minute, and log every use.**
+  They skip the rate limit and `credential_events` can't be cleaned up, so never
+  write a row per request or scan on the request path.
 - **The limit is counted after authentication, by key, never by address.**
   Counting first would let anyone who has seen a prefix lock its owner out. The
   legacy routes have no key row, so they carry no limit.
@@ -155,6 +164,31 @@ caller comes from the request context, so the two cannot drift apart.
   limit never silently stops applying.
 - **`rate limit refused` log lines are the proof of enforcement.** Counter rows
   are gone within the hour, so nothing else records a refusal.
+
+## Webhooks go to whoever created the order
+
+`internal/notify` works one lane per integrator. Linq-B2B's lane uses
+`MERCHANT_WEBHOOK_URL` and `MERCHANT_WEBHOOK_SECRET`, and its deliveries must not
+change: `testdata/legacy_delivery.golden` was captured from the code before
+lanes existed. Never regenerate it to make a test pass.
+
+- **A lane exists so one endpoint can't hold up the others.** Delivering
+  sequentially, a hanging endpoint costs everyone behind it the timeout per event.
+- **An integrator's URL is untrusted, and the worker calls it from inside our
+  network.** `NewIntegratorClient` refuses non-public addresses at dial time,
+  after DNS, and follows no redirects. Send to these URLs with no other client.
+- **An integrator's delivery is never unsigned.** No secret means no delivery,
+  and the report stays owed.
+- **A failing integrator gets one attempt per backoff, not one per event.**
+  Linq-B2B keeps its old behaviour of trying each event.
+- **An integrator never sees a stored reason.** It quotes payout providers and
+  internal URLs. `store.PublicReason` is what the webhook and `/v1` show, and a
+  state with no message there shows nothing. Linq-B2B keeps the raw text.
+- **Log and store the host, never the URL.** A path can carry the integrator's
+  token, and `cleanError` removes it from errors.
+- **`owedEvents` is the query and the index predicate, word for word.** Change
+  one and the sweep falls back to reading most of the table. Adding a state to
+  `notifiable` means adding it there, and replacing the index.
 
 ## Payout attempts and references
 
@@ -167,7 +201,9 @@ sent. Its reference is the idempotency key Linq sees: the order ID, then
   `retrySafe: true`. A `failed` from the POST, a timeout, an error or `queued`
   means resend the same reference later (`wait`). Linq reports `failed` for
   some outcomes the bank never confirmed, such as an HTTP 5xx from the bank, so
-  `failed` alone is not proof that no money moved.
+  `failed` alone is not proof that no money moved. The Linq backend does not
+  send `retrySafe` yet, so with the switch on every real failure goes to a
+  person and only induced failures retry.
 - **An unknown outcome never refunds and never counts as an attempt.** The
   order goes back to `payout_queued` with `payout_after` 30 seconds out.
 - **With the switch on, a failure that is not retry-safe goes to `failed`** for

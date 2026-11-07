@@ -125,7 +125,9 @@ func run() error {
 			Log:    log.With("component", "notify"),
 			URL:    cfg.MerchantWebhookURL,
 			Secret: cfg.MerchantWebhookSecret,
-			Bus:    bus,
+			// EncryptSeed and DecryptSeed seal any secret, under ENCRYPTION_KEY.
+			OpenSecret: chain.DecryptSeed,
+			Bus:        bus,
 		}).Run,
 		// Sixth: the pool keeper. It is the only loop that does no work for an
 		// order already in flight — it works for the next one, so that accepting
@@ -176,7 +178,8 @@ func run() error {
 const housekeepingInterval = 5 * time.Minute
 
 // housekeeping is one pass of the credential upkeep: write the `expired` event
-// for keys that have lapsed, and delete rate counters past their hour.
+// for keys that have lapsed, and delete rate counters and the delivery log past
+// their retention.
 func housekeeping(db *gorm.DB, log *slog.Logger) func(context.Context) bool {
 	return func(context.Context) bool {
 		now := time.Now().UTC()
@@ -188,8 +191,13 @@ func housekeeping(db *gorm.DB, log *slog.Logger) func(context.Context) bool {
 		if err != nil {
 			log.Error("could not prune rate counters", "error", err)
 		}
-		if expired > 0 || pruned > 0 {
-			log.Info("housekeeping pass", "keysExpired", expired, "countersPruned", pruned)
+		deliveries, err := store.PruneWebhookDeliveries(db, now)
+		if err != nil {
+			log.Error("could not prune webhook deliveries", "error", err)
+		}
+		if expired > 0 || pruned > 0 || deliveries > 0 {
+			log.Info("housekeeping pass", "keysExpired", expired, "countersPruned", pruned,
+				"deliveriesPruned", deliveries)
 		}
 		// Always "worked": this loop keeps its interval rather than backing off.
 		return true
