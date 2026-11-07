@@ -80,11 +80,23 @@ func TestMovingAWebhookKeepsItsSecret(t *testing.T) {
 		t.Error("moving the URL changed the secret")
 	}
 
-	// Clearing and setting again is how a leaked secret is replaced.
-	p.setWebhook(t, id, `{"url":""}`)
-	_, replaced := p.setWebhook(t, id, `{"url":"https://new.example.com/linq"}`)
-	if replaced["webhookSecret"] == nil || replaced["webhookSecret"] == first["webhookSecret"] {
-		t.Errorf("secret after clearing = %v", replaced["webhookSecret"])
+	// A leaked secret is replaced in place: the webhook is never empty, so there
+	// is no moment for a pass to find nothing to send to.
+	code, replaced := p.setWebhook(t, id, `{"url":"https://new.example.com/linq","rotateSecret":true}`)
+	if code != http.StatusOK || replaced["webhookSecret"] == nil || replaced["webhookSecret"] == first["webhookSecret"] {
+		t.Errorf("rotate: %d, secret = %v", code, replaced["webhookSecret"])
+	}
+	var rotated store.Integrator
+	p.db.First(&rotated, "id = ?", id)
+	if rotated.WebhookSecretEncrypted == before.WebhookSecretEncrypted || rotated.WebhookURL == "" {
+		t.Errorf("after rotating: %+v", rotated)
+	}
+	if strings.Contains(p.logs.String(), replaced["webhookSecret"].(string)) {
+		t.Error("the secret was logged")
+	}
+
+	if code, _ := p.setWebhook(t, id, `{"url":"","rotateSecret":true}`); code != http.StatusBadRequest {
+		t.Errorf("rotating with no url: %d, want 400", code)
 	}
 }
 

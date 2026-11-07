@@ -139,6 +139,8 @@ caller comes from the request context, so the two cannot drift apart.
   (`GET /b2b/rate` on the Linq backend, held `payout.RateMaxAge`). No rate
   means no order: never fall back to a stale or supplied one. Only the legacy
   key sends a rate, which Linq-B2B fetches from that same route.
+  `manualDeposit` is legacy-only for the same reason: it pays for whatever
+  arrives at the locked rate.
 - **A key is never stored or logged.** Only `key_prefix` and a SHA-256 of the
   whole key. `writeIssuedKey` is the one place a full key leaves the service.
 - **`credential_events` is the rotation and revocation proof, and a Postgres
@@ -146,6 +148,13 @@ caller comes from the request context, so the two cannot drift apart.
   change a key must write a row there, in the same transaction as the change.
 - **A key inside its rotation overlap cannot rotate again.** Otherwise a leaked
   key could mint a successor and outlive the rotation.
+- **Revoking a key revokes everything it rotated to.** A leaked key can rotate
+  once, so its successor is just as compromised.
+- **`linq-b2b` cannot hold an issued key.** All its orders are under that one
+  integrator, so a key there would read every one of them.
+- **Rejected keys write one row per key, action and minute, and log every use.**
+  They skip the rate limit and `credential_events` can't be cleaned up, so never
+  write a row per request or scan on the request path.
 - **The limit is counted after authentication, by key, never by address.**
   Counting first would let anyone who has seen a prefix lock its owner out. The
   legacy routes have no key row, so they carry no limit.
@@ -217,16 +226,24 @@ engine that "fixed" a balance it had misread would move money on a bug.
   before checking anything, items as they are found, and the counts and error
   in a deferred finish, so a cycle that stops partway still says what it
   checked and why it stopped.
-- **A passed check is final, and a resolved mismatch is not flagged again.**
+- **A passed check is final; a resolution covers only the answer it explained.**
   The ledger does not change a confirmed transaction (`SettledChecks`). A
-  mismatch is checked again every cycle until someone resolves it with
-  `POST /admin/reconciliation/items/{id}/resolve`, which writes once.
+  mismatch is recorded again every cycle until someone resolves it with
+  `POST /admin/reconciliation/items/{id}/resolve`, which writes once and covers
+  every copy of that problem. A resolved transaction check is done
+  (`finalOnceResolved`). Every other check keeps running, records nothing while
+  its answer is the one explained (`ExplainedAlready`), and records a new
+  mismatch when it changes: a refunded order's payout explained as "pending"
+  that later pays must be flagged. A resolved error settles nothing.
 - **Look twice before recording a mismatch that could be the order moving.**
   A deposit seen a second before the detector claims it is not a missed
   deposit. Re-read the order and record nothing if it moved.
-- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`),
-  newest orders first. A Horizon rate-limit refusal stops the cycle's Horizon
-  checks rather than spending the rest of the budget being refused.
+- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`).
+  Open accounts get half the Horizon budget first and the leftovers last, and
+  take turns from where the last cycle stopped (`Engine.openAfter`), so a long
+  list of them can't starve the finished orders. Finished orders go newest
+  first. A Horizon rate-limit refusal stops the cycle's Horizon checks rather
+  than spending the rest of the budget being refused.
 - **The sponsored-account check stays behind `RECONCILE_SPONSORED_ACCOUNTS`.**
   Pool accounts count as known. If another service opens accounts with the same
   sponsor, every one of them would be reported.
@@ -236,8 +253,9 @@ engine that "fixed" a balance it had misread would move money on a bug.
   be paid on a refunded order. Induced attempts never reached Linq and are not
   asked about; an order with no attempts on record is asked about by its ID.
   An order's references are asked about together or not at all in a cycle.
-  The Linq backend's `GET /internal/payout` does not send an amount yet; the
-  check compares one as soon as it does.
+  The amount is compared when the Linq backend's `GET /internal/payout` sends
+  `amountNGN` (naira), which Linq-v2 #105 adds; until then the item says
+  "amount not reported".
 - **`expected` and `actual` are read by reviewers.** Never put bank details in
   them.
 
@@ -282,3 +300,9 @@ go build ./... && go vet ./... && go test ./...
 No database, network or keys needed. `TestQuotingAndSettlingRoundTripsExactly`
 is the invariant: quote an invoice, pay exactly that quote, merchant receives
 the invoice to the kobo.
+
+The store tests also run against Postgres when `LINQ_TEST_PG_DSN` points at a
+local database (key=value form, e.g. `host=127.0.0.1 user=postgres
+password=postgres dbname=linqtest sslmode=disable`). SQLite misses migration
+races and Postgres-only constraints, so run them there before merging anything
+that touches the schema or a store query.

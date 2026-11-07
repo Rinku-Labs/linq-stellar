@@ -343,6 +343,10 @@ func TestRecordedTransactionsMatchTheLedger(t *testing.T) {
 	wrongAmount := h.order(4, store.Order{Status: store.StateDisbursed, AmountUSDC: 0.08, DepositTxHash: "dep4"})
 	h.ledger.holds(acct(4), 0.08)
 	h.ledger.pays("dep4", move(payer, acct(4), 0.07))
+	// More than recorded is no split deposit, so no hint.
+	tooMuch := h.order(11, store.Order{Status: store.StateDisbursed, AmountUSDC: 0.08, DepositTxHash: "dep11"})
+	h.ledger.holds(acct(11), 0.08)
+	h.ledger.pays("dep11", move(payer, acct(11), 0.09))
 
 	elsewhere := h.order(5, store.Order{Status: store.StateSettledInTreasury, AmountUSDC: 1, SweepTxHash: "swp5"})
 	h.ledger.pays("swp5", move(acct(5), stranger, 1))
@@ -377,7 +381,10 @@ func TestRecordedTransactionsMatchTheLedger(t *testing.T) {
 	if m := expect(t, items, failed.ID+"/deposit_tx", store.ReconcileMismatch); m.Actual != "the transaction is on the ledger but failed, so it moved nothing" {
 		t.Errorf("failed tx: %q", m.Actual)
 	}
-	if m := expect(t, items, wrongAmount.ID+"/deposit_tx", store.ReconcileMismatch); m.Actual != "the transaction paid 0.07 USDC into the deposit account" {
+	if m := expect(t, items, tooMuch.ID+"/deposit_tx", store.ReconcileMismatch); m.Actual != "the transaction paid 0.09 USDC into the deposit account" {
+		t.Errorf("more than recorded: %q", m.Actual)
+	}
+	if m := expect(t, items, wrongAmount.ID+"/deposit_tx", store.ReconcileMismatch); m.Actual != "the transaction paid 0.07 USDC into the deposit account; if the payer sent the deposit in more than one payment, the rest is in a transaction this order does not record" {
 		t.Errorf("wrong amount: %q", m.Actual)
 	}
 	expect(t, items, elsewhere.ID+"/sweep_tx", store.ReconcileOK)
@@ -697,6 +704,141 @@ func TestAPayoutIsCheckedWholeOrNotAtAll(t *testing.T) {
 	}
 }
 
+// resolve writes a note on a cycle's item, as an admin would.
+func (h *harness) resolve(item store.ReconciliationItem, note string) {
+	h.t.Helper()
+	if _, err := store.ResolveReconciliationItem(h.db, item.ID, note, "ify", h.clock); err != nil {
+		h.t.Fatalf("resolve %s/%s: %v", item.OrderID, item.CheckName, err)
+	}
+}
+
+// A note covers the answer it explained. A check whose answer can change keeps
+// running, records nothing while the answer stays the one explained, and
+// records a new mismatch when it changes. (Tanta's review of #6.)
+func TestAResolutionCoversOnlyTheAnswerItExplained(t *testing.T) {
+	h := newHarness(t)
+
+	// A refunded order whose payout is still going, explained as pending.
+	pending := h.order(1, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	h.payouts.results[pending.ID] = payout.Result{Status: payout.StatusQueued, Reference: "lq_1", Provider: "nomba"}
+	// A refunded order's account still open, explained as awaiting a reclaim.
+	lingering := h.order(2, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	h.payouts.results[lingering.ID] = payout.Result{Status: payout.StatusFailed}
+	h.ledger.holds(lingering.DepositAddress, 0)
+	// A payout the Linq backend could not be asked about.
+	unasked := h.order(3, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	h.payouts.fail[unasked.ID] = errors.New("payout: connection refused")
+	// An open account holding funds its order does not know about.
+	open := h.order(4, store.Order{Status: store.StateAwaitingDeposit})
+	h.ledger.holds(open.DepositAddress, 0.05)
+
+	_, first := h.cycle()
+	h.resolve(expect(t, first, pending.ID+"/payout", store.ReconcileMismatch), "Nomba pending, watching")
+	h.resolve(expect(t, first, lingering.ID+"/account_closed", store.ReconcileMismatch), "Reclaim queued")
+	h.resolve(expect(t, first, unasked.ID+"/payout", store.ReconcileError), "Linq was down")
+	h.resolve(expect(t, first, open.ID+"/open_account", store.ReconcileMismatch), "Payer testing the address")
+
+	// The same answers: each check runs again and records nothing, except the
+	// error, which was never an answer and is asked again.
+	calls := h.payouts.calls
+	h.payouts.fail = map[string]error{}
+	h.payouts.results[unasked.ID] = payout.Result{Status: payout.StatusFailed}
+	_, second := h.cycle()
+	absent(t, second, pending.ID+"/payout")
+	absent(t, second, lingering.ID+"/account_closed")
+	absent(t, second, open.ID+"/open_account")
+	expect(t, second, unasked.ID+"/payout", store.ReconcileOK)
+	if h.payouts.calls-calls != 2 {
+		t.Errorf("payout calls in the second cycle: %d, want 2: the resolved payout is still asked about", h.payouts.calls-calls)
+	}
+	for key, item := range second {
+		// These refunded orders record no refund transaction, which is its own
+		// unexplained mismatch every cycle.
+		if item.Result == store.ReconcileMismatch && item.CheckName != CheckRefundTx {
+			t.Errorf("%s recorded again: %q", key, item.Actual)
+		}
+	}
+
+	// Nomba pays after all, and the open account receives more: new answers,
+	// so new mismatches, needing their own notes. The account is merged, which
+	// is a pass and settles that check.
+	h.payouts.results[pending.ID] = payout.Result{Status: payout.StatusPaid, Reference: "lq_1", Provider: "nomba"}
+	h.ledger.holds(open.DepositAddress, 0.08)
+	delete(h.ledger.accounts, lingering.DepositAddress)
+	_, third := h.cycle()
+	paid := expect(t, third, pending.ID+"/payout", store.ReconcileMismatch)
+	if paid.ResolvedAt != nil || !strings.Contains(paid.Actual, "paid, but the USDC was refunded") {
+		t.Errorf("the payout that paid after its note: %+v", paid)
+	}
+	if m := expect(t, third, open.ID+"/open_account", store.ReconcileMismatch); m.ResolvedAt != nil || !strings.Contains(m.Actual, "0.08") {
+		t.Errorf("the open account's new answer: %+v", m)
+	}
+	expect(t, third, lingering.ID+"/account_closed", store.ReconcileOK)
+
+	_, fourth := h.cycle()
+	absent(t, fourth, lingering.ID+"/account_closed")
+	absent(t, fourth, unasked.ID+"/payout")
+}
+
+// Open accounts get half the Horizon budget first, then whatever the cycle
+// leaves over, and carry on from where the last cycle stopped. A long list of
+// them can't starve the finished orders, and every one gets its turn. (Tanta's
+// review of #6.)
+func TestOpenAccountsShareTheBudgetAndTakeTurns(t *testing.T) {
+	h := newHarness(t)
+	h.engine.CheckSponsored = false
+	h.engine.HorizonCalls = 4
+	for n := 1; n <= 6; n++ {
+		o := h.order(n, store.Order{Status: store.StateAwaitingDeposit})
+		h.ledger.holds(o.DepositAddress, 0)
+	}
+	done := h.order(10, settled(0.08, 10000))
+	h.ledger.pays("dep", move(payer, done.DepositAddress, 0.08))
+	h.ledger.pays("swp", move(done.DepositAddress, treasury, 0.08))
+	h.payouts.results[done.ID] = payout.Result{Status: payout.StatusPaid, Reference: "lq_payout_1", Provider: "nomba"}
+
+	openChecked := func(items map[string]store.ReconciliationItem) string {
+		var ids []string
+		for _, item := range items {
+			if item.CheckName == CheckOpenAccount {
+				ids = append(ids, strings.TrimPrefix(item.OrderID, "ord_"))
+			}
+		}
+		sort.Strings(ids)
+		return strings.Join(ids, ",")
+	}
+	cycle := func() map[string]store.ReconciliationItem {
+		before := h.ledger.calls
+		_, items := h.cycle()
+		if spent := h.ledger.calls - before; spent > 4 {
+			t.Errorf("a cycle spent %d Horizon calls, budget 4", spent)
+		}
+		return items
+	}
+
+	// Half the budget to open accounts; the finished order takes the rest.
+	first := cycle()
+	if got := openChecked(first); got != "001,002" {
+		t.Errorf("first cycle checked open accounts %s, want 001,002", got)
+	}
+	expect(t, first, done.ID+"/deposit_tx", store.ReconcileOK)
+	expect(t, first, done.ID+"/sweep_tx", store.ReconcileOK)
+
+	// The next ones, and one more with what the finished order left over.
+	second := cycle()
+	if got := openChecked(second); got != "003,004,005" {
+		t.Errorf("second cycle checked open accounts %s, want 003,004,005", got)
+	}
+	expect(t, second, done.ID+"/account_closed", store.ReconcileOK)
+
+	// Nothing else needs the budget, so open accounts get all of it, wrapping
+	// round to the start.
+	third := cycle()
+	if got := openChecked(third); got != "001,002,003,006" {
+		t.Errorf("third cycle checked open accounts %s, want 001,002,003,006", got)
+	}
+}
+
 // A check that passed has its answer; a mismatch is looked at again until
 // someone resolves it.
 func TestPassedAndResolvedChecksAreNotRepeated(t *testing.T) {
@@ -726,8 +868,14 @@ func TestPassedAndResolvedChecksAreNotRepeated(t *testing.T) {
 	if _, err := store.ResolveReconciliationItem(h.db, mismatch.ID, "Induced for the demo", "ify", h.clock); err != nil {
 		t.Fatal(err)
 	}
+	calls := h.ledger.calls
 	_, third := h.cycle()
 	absent(t, third, o.ID+"/sweep_to_treasury")
+	// A resolved transaction check is done: not even asked about again. The
+	// two calls are the open account and the sponsor's account list.
+	if h.ledger.calls-calls != 2 {
+		t.Errorf("third cycle made %d Horizon calls, want 2", h.ledger.calls-calls)
+	}
 }
 
 // A backlog bigger than one cycle's budget is worked through over several,
@@ -793,6 +941,27 @@ func TestARateLimitStopsHorizonChecksForTheCycle(t *testing.T) {
 	}
 	if c.Error == "" || c.FinishedAt == nil {
 		t.Errorf("cycle should finish and say it stopped early: %+v", c)
+	}
+}
+
+// A rate-limit refusal on an open account stops the open accounts too, in
+// both of the cycle's passes over them.
+func TestARateLimitStopsOpenAccountChecks(t *testing.T) {
+	h := newHarness(t)
+	h.engine.CheckSponsored = false
+	for n := 1; n <= 4; n++ {
+		o := h.order(n, store.Order{Status: store.StateAwaitingDeposit})
+		h.ledger.holds(o.DepositAddress, 0)
+	}
+	h.ledger.fail[depositAccount(1)] = fmt.Errorf("%w: Rate Limit Exceeded", stellar.ErrRateLimited)
+
+	c, items := h.cycle()
+	expect(t, items, "ord_001/open_account", store.ReconcileError)
+	for n := 2; n <= 4; n++ {
+		absent(t, items, fmt.Sprintf("ord_%03d/open_account", n))
+	}
+	if h.ledger.calls != 1 || c.Error == "" {
+		t.Errorf("%d Horizon calls, want 1; cycle error %q", h.ledger.calls, c.Error)
 	}
 }
 

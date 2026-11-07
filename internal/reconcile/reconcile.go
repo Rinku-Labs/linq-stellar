@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -117,6 +118,12 @@ type Engine struct {
 
 	Log *slog.Logger
 	Now func() time.Time
+
+	// openAfter is the last open order whose account was checked. The next
+	// cycle carries on after it, so open accounts take turns when there are
+	// more than a cycle's share of the budget can reach. It is not saved: a
+	// restarted worker starts again from the first.
+	openAfter string
 }
 
 func (e *Engine) now() time.Time {
@@ -147,6 +154,14 @@ var openStates = []string{
 	store.StateRefundQueued,
 }
 
+// finalOnceResolved are the checks whose answer the ledger fixes for good: a
+// transaction, once on the ledger or not, does not change. A resolved mismatch
+// on one of these is not checked again. Every other check keeps running after
+// a resolution, because its answer can change: a payout that was "still in
+// progress" when someone explained it can pay later, and an account can be
+// merged after all.
+var finalOnceResolved = []string{CheckDepositTx, CheckSweepTx, CheckRefundTx, CheckSweepToTreasury}
+
 // paidStates are the states in which the merchant has been paid.
 var paidStates = []string{
 	store.StateDisbursed,
@@ -167,7 +182,14 @@ type run struct {
 	limited error
 	// deferred counts checks left for a later cycle by the budget.
 	deferred int
-	orders   map[string]bool
+	// explained counts mismatches not recorded again because a person has
+	// already resolved that exact answer.
+	explained int
+	orders    map[string]bool
+	// open is every open order, loaded once a cycle, and openSeen those whose
+	// account this cycle has checked.
+	open     []store.Order
+	openSeen map[string]bool
 }
 
 // RunCycle runs one reconciliation cycle and returns its record.
@@ -184,7 +206,7 @@ func (e *Engine) RunCycle(ctx context.Context) (result store.ReconciliationCycle
 	r := &run{
 		e: e, ctx: ctx, cycle: cycle,
 		horizonLeft: e.HorizonCalls, payoutsLeft: e.PayoutCalls,
-		orders: map[string]bool{},
+		orders: map[string]bool{}, openSeen: map[string]bool{},
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -194,7 +216,17 @@ func (e *Engine) RunCycle(ctx context.Context) (result store.ReconciliationCycle
 		result = r.cycle
 	}()
 
-	for _, step := range []func() error{r.openAccounts, r.finishedOrders, r.sponsoredAccounts} {
+	// Open accounts get half the Horizon budget first, so a long list of them
+	// cannot starve the finished orders, and whatever the cycle leaves over at
+	// the end.
+	half := (r.horizonLeft + 1) / 2
+	steps := []func() error{
+		func() error { return r.openAccounts(half) },
+		r.finishedOrders,
+		r.sponsoredAccounts,
+		func() error { return r.openAccounts(len(r.open)) },
+	}
+	for _, step := range steps {
 		if ctx.Err() != nil {
 			r.fail(errors.New("stopped early: the worker is shutting down"))
 			break
@@ -204,6 +236,7 @@ func (e *Engine) RunCycle(ctx context.Context) (result store.ReconciliationCycle
 			break
 		}
 	}
+	r.deferred += len(r.open) - len(r.openSeen)
 	if r.limited != nil && r.cycle.Error == "" {
 		r.fail(fmt.Errorf("stopped Horizon checks early: %v", r.limited))
 	}
@@ -231,6 +264,7 @@ func (r *run) finish(started time.Time) {
 		"matched", r.cycle.Matched,
 		"mismatches", r.cycle.Mismatches,
 		"deferred", r.deferred,
+		"explained", r.explained,
 		"elapsed_ms", r.e.now().Sub(started).Milliseconds(),
 	}
 	if r.cycle.Error != "" {
@@ -268,9 +302,23 @@ func (r *run) outOfBudget() bool {
 	return horizonDone && payoutsDone
 }
 
-// record writes one item and counts it.
+// record writes one item and counts it. A mismatch whose exact answer a person
+// has already resolved is not written again; a different answer is.
 func (r *run) record(item store.ReconciliationItem) error {
 	item.CycleID = r.cycle.ID
+	if item.Result == store.ReconcileMismatch {
+		explained, err := store.ExplainedAlready(r.e.DB, item)
+		if err != nil {
+			return fmt.Errorf("look up resolutions of %s for %q: %w", item.CheckName, item.OrderID, err)
+		}
+		if explained {
+			if item.OrderID != "" {
+				r.orders[item.OrderID] = true
+			}
+			r.explained++
+			return nil
+		}
+	}
 	if err := store.AddReconciliationItem(r.e.DB, &item); err != nil {
 		return fmt.Errorf("record %s for %q: %w", item.CheckName, item.OrderID, err)
 	}
@@ -322,22 +370,39 @@ func (r *run) reload(id string) (store.Order, error) {
 
 // --- 1. Open deposit accounts -------------------------------------------------
 
-func (r *run) openAccounts() error {
-	var open []store.Order
-	err := r.e.DB.Select("id", "status", "deposit_address", "amount_usdc").
-		Where("status IN ? AND deposit_address <> ''", openStates).
-		Order("updated_at, id").Find(&open).Error
-	if err != nil {
-		return fmt.Errorf("load open orders: %w", err)
-	}
-	for i := range open {
-		if r.ctx.Err() != nil {
-			return nil
+// openAccounts checks up to limit open deposit accounts, carrying on after the
+// last one checked and wrapping round to the first, so a list longer than the
+// budget reaches is covered over several cycles instead of the same ones every
+// time. An account already checked this cycle is not checked again.
+func (r *run) openAccounts(limit int) error {
+	if r.open == nil {
+		open := []store.Order{}
+		err := r.e.DB.Select("id", "status", "deposit_address", "amount_usdc").
+			Where("status IN ? AND deposit_address <> ''", openStates).
+			Find(&open).Error
+		if err != nil {
+			return fmt.Errorf("load open orders: %w", err)
 		}
-		if !r.spendHorizon() {
+		// Sorted here rather than by the database, whose collation need not
+		// order the IDs the way the cursor compares them.
+		sort.Slice(open, func(i, j int) bool { return open[i].ID < open[j].ID })
+		r.open = open
+	}
+	start := sort.Search(len(r.open), func(i int) bool { return r.open[i].ID > r.e.openAfter })
+	checked := 0
+	for k := 0; k < len(r.open) && checked < limit; k++ {
+		o := &r.open[(start+k)%len(r.open)]
+		if r.openSeen[o.ID] {
 			continue
 		}
-		if err := r.checkOpenAccount(&open[i]); err != nil {
+		if r.ctx.Err() != nil || r.limited != nil || r.horizonLeft <= 0 {
+			return nil
+		}
+		r.horizonLeft--
+		r.openSeen[o.ID] = true
+		r.e.openAfter = o.ID
+		checked++
+		if err := r.checkOpenAccount(o); err != nil {
 			return err
 		}
 	}
@@ -386,11 +451,11 @@ func (r *run) checkOpenAccount(o *store.Order) error {
 
 // --- 2, 3, 4 and 6: finished work ---------------------------------------------
 
-// finishedOrders runs the checks whose answer never changes once given: the
-// transactions an order recorded, whether its account was closed, and the
-// payout. Newest orders first, so a demo order is checked in the next cycle
-// whatever backlog sits behind it; a check that has passed, or whose mismatch
-// someone resolved, is not run again.
+// finishedOrders runs the checks on an order past waiting for a deposit: the
+// transactions it recorded, whether its account was closed, and the payout.
+// Newest orders first, so a demo order is checked in the next cycle whatever
+// backlog sits behind it. A check that has passed is not run again, nor is a
+// resolved transaction check (finalOnceResolved).
 func (r *run) finishedOrders() error {
 	var afterCreated time.Time
 	afterID := ""
@@ -416,7 +481,7 @@ func (r *run) finishedOrders() error {
 		for i, o := range page {
 			ids[i] = o.ID
 		}
-		settled, err := store.SettledChecks(r.e.DB, ids)
+		settled, err := store.SettledChecks(r.e.DB, ids, finalOnceResolved)
 		if err != nil {
 			return fmt.Errorf("load settled checks: %w", err)
 		}
@@ -570,7 +635,14 @@ func (r *run) checkDeposit(o *store.Order) error {
 		return r.mismatch(item, "the transaction paid no USDC into the deposit account")
 	}
 	if math.Abs(paid-o.AmountUSDC) > money.DustUSDC {
-		return r.mismatch(item, fmt.Sprintf("the transaction paid %s USDC into the deposit account", usdc(paid)))
+		actual := fmt.Sprintf("the transaction paid %s USDC into the deposit account", usdc(paid))
+		if paid < o.AmountUSDC {
+			// The order records one deposit transaction, but its amount is
+			// everything that arrived, so a payer who sent it in two parts
+			// lands here. Say so, for whoever resolves it.
+			actual += "; if the payer sent the deposit in more than one payment, the rest is in a transaction this order does not record"
+		}
+		return r.mismatch(item, actual)
 	}
 	return r.ok(item, fmt.Sprintf("a successful payment of %s USDC into the deposit account", usdc(paid)))
 }

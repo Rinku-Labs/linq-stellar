@@ -52,7 +52,7 @@ The reply is `201` with the order:
 }
 ```
 
-Ask your payer to send `quotedUsdc` of the asset named by `assetCode` and `assetIssuer` to `depositAddress` before `depositDeadline`. `paymentUri` is a SEP-7 link a wallet can open or scan, and carries the same details.
+Ask your payer to send `quotedUsdc` of the asset named by `assetCode` and `assetIssuer` to `depositAddress` before `depositDeadline`. USDC from any other issuer won't be recognised as a deposit. `paymentUri` is a SEP-7 link a wallet can open or scan, and carries the same details.
 
 Then check on the order:
 
@@ -64,7 +64,7 @@ curl -sS "$LINQ_API/v1/orders/$ORDER_ID" -H "X-API-Key: $LINQ_KEY"
 
 Send your key in the `X-API-Key` header on every request. Linq issues your first key, and it is shown only once. Linq stores a hash of it, so a lost key can't be recovered, only replaced.
 
-Keys look like `lq_live_<prefix>_<secret>`, or `lq_test_<prefix>_<secret>` in test mode. Keep them on your server, never in a browser or mobile app.
+Keys look like `lq_live_<prefix>_<secret>`. Keep them on your server, never in a browser or mobile app.
 
 ## Creating an order
 
@@ -81,8 +81,7 @@ What gets paid depends on the deposit:
 
 | Deposit | Bank receives |
 |---|---|
-| Covers `quotedUsdc` | `quotedNgn` |
-| More than `quotedUsdc`, on an order with `manualDeposit: true` | What the deposit is worth at the order's rate |
+| Covers or exceeds `quotedUsdc` | `quotedNgn` |
 | Less than `quotedUsdc` | What the deposit is worth at the order's rate. The order then shows `underpaid: true` and `shortfallNgn` |
 
 Keep `customerRef` to 28 bytes or fewer. It becomes the memo in `paymentUri`, and Stellar text memos are limited to 28 bytes.
@@ -121,7 +120,7 @@ The reply is `201` with the new key in `key`, shown only this once:
 
 The old key keeps working for 24 hours, until `previousKey.expiresAt`, so you can deploy the new one without downtime. An old key can't be rotated a second time, which returns `409`. Rotate from the new key instead.
 
-If a key may have leaked, contact Linq to have it revoked at once. Rotating alone leaves the old key working for 24 hours.
+If a key may have leaked, contact Linq to have it revoked at once. Rotating alone leaves the old key working for 24 hours. Revoking a key also revokes any key rotated from it, so Linq will issue you a new one.
 
 ## Rate limits
 
@@ -161,7 +160,7 @@ An order also reports `statusHistory`, each move with its time, and `statusReaso
 
 ## Webhooks
 
-Linq can send order updates to a URL of yours, so you don't have to poll. Give Linq an `https` URL on a public address, and you receive a signing secret, shown only once. You can change the URL later and keep the same secret. Without a webhook, poll `GET /v1/orders/{id}`.
+Linq can send order updates to a URL of yours, so you don't have to poll. Give Linq an `https` URL on a public address, and you receive a signing secret, shown only once. You can change the URL later and keep the same secret. Linq can also replace the secret, which takes effect at once, so update your check at the same time. Without a webhook, poll `GET /v1/orders/{id}`.
 
 You receive a `POST` with a JSON body when an order reaches one of these statuses: `deposit_detected`, `disbursed`, `settled_in_treasury`, `refund_queued`, `refunded`, `expired` or `failed`.
 
@@ -213,7 +212,7 @@ Errors are JSON with a `message`:
 | `401` | The key is missing, wrong, revoked or expired | Check your key |
 | `403` | Your account is suspended | Contact Linq |
 | `404` | No such order on your account | Check the id. Other accounts' orders are also 404 |
-| `409` | This key is revoked, expired or already rotated | Rotate from your newest key |
+| `409` | This key was already rotated | Rotate from your newest key |
 | `429` | Over your rate limit | Wait for `Retry-After` |
 | `500` | Something went wrong at Linq | Retry with the same `idempotencyKey` |
 | `503` | Linq can't price or prepare the order right now | Retry shortly with the same `idempotencyKey` |
@@ -222,6 +221,4 @@ Request bodies over 64 KiB are refused with `400`.
 
 ## Test mode
 
-Test mode is a separate deployment on the Stellar test network, with its own host and its own `lq_test_` keys. Live and test keys don't work on each other's deployment.
-
-The API is the same. Deposits use testnet USDC, which has no value, and the issuer in each order's `assetIssuer` is the testnet one. Always use the `assetIssuer` from the order: USDC from another issuer won't be recognised as a deposit.
+**Coming soon.** Test mode isn't available yet. It will be a separate deployment on the Stellar test network, with its own host and its own `lq_test_` keys.
