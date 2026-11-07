@@ -267,6 +267,20 @@ components:
           items: { $ref: '#/components/schemas/StatusEvent' }
         statusHistorySeconds: { type: number, description: Seconds between the first and last entry in statusHistory. }
         statusReason: { type: string, description: 'A fixed message, present after a payout failed. Contact Linq for the specific cause.' }
+        payoutAttempts:
+          type: array
+          description: 'Each try at the payout, first to last. Present on GET /v1/orders/{id}. A retry after a confirmed failure is a new payout with its own reference.'
+          items: { $ref: '#/components/schemas/PayoutAttempt' }
+    PayoutAttempt:
+      type: object
+      required: [number, reference, outcome, induced, startedAt, updatedAt]
+      properties:
+        number: { type: integer, description: Counts from 1. }
+        reference: { type: string, description: 'The reference sent to the payout provider: the order ID, then <order>-p2, <order>-p3 for retries that were given their own.' }
+        outcome: { type: string, enum: [pending, paid, failed] }
+        induced: { type: boolean, description: 'True when the failure was induced on a Linq test order. It never reached the provider.' }
+        startedAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
     OrderStatus:
       type: string
       enum:
