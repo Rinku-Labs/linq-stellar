@@ -20,6 +20,10 @@ type Config struct {
 	Port        string
 	LogLevel    string
 	DatabaseURL string
+	// DBMaxOpenConns caps the server's connections to Postgres, so a burst of
+	// requests queues for a connection instead of exhausting the database for
+	// every other service on it. The cap is per instance. The worker is not capped.
+	DBMaxOpenConns int
 
 	HorizonURL        string
 	NetworkPassphrase string
@@ -49,6 +53,21 @@ type Config struct {
 	// server binary is the one that requires it before it will listen.
 	OrdersAPIKey string
 
+	// PublicAPIEnabled serves /v1 and /admin. Off unless set to "true": orders
+	// taken there move money, and turning it off must not touch the legacy
+	// routes.
+	PublicAPIEnabled bool
+	// PayoutNewReferenceOnRetry gives each payout retry its own reference, so a
+	// retry after a confirmed failure really pays. Off unless set to "true";
+	// see payout.Worker.NewReferenceOnRetry.
+	PayoutNewReferenceOnRetry bool
+	// AdminAPIKey guards /admin, sent as X-Admin-Key. Empty refuses every admin
+	// request; the server still starts, so the legacy routes never depend on it.
+	AdminAPIKey string
+	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// page does not exist.
+	ReviewerToken string
+
 	HomeDomain       string
 	WebAuthDomain    string
 	SEP10SigningKey  string
@@ -67,7 +86,21 @@ type Config struct {
 	OrgURL         string
 	OrgDescription string
 	OrgEmail       string
+
+	// Reconciliation, run by the worker. ReconcileInterval is how often a cycle
+	// runs. The two call budgets bound one cycle's requests to Horizon and to
+	// the payout provider; what a cycle cannot reach waits for the next one.
+	// ReconcileSponsoredAccounts turns on the search for sponsored accounts
+	// with no order behind them, which stays off until the sponsor is known not
+	// to be shared with another service.
+	ReconcileInterval          time.Duration
+	ReconcileHorizonCalls      int
+	ReconcilePayoutCalls       int
+	ReconcileSponsoredAccounts bool
 }
+
+// minReviewerTokenLen is the shortest REVIEWER_TOKEN accepted.
+const minReviewerTokenLen = 32
 
 // Load reads configuration from the environment.
 //
@@ -79,6 +112,7 @@ func Load() (Config, error) {
 		Port:              env("PORT", "8080"),
 		LogLevel:          env("LOG_LEVEL", "info"),
 		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		DBMaxOpenConns:    int(integer("DB_MAX_OPEN_CONNS", 20)),
 		HorizonURL:        os.Getenv("STELLAR_HORIZON_URL"),
 		NetworkPassphrase: os.Getenv("STELLAR_NETWORK_PASSPHRASE"),
 		USDCIssuer:        os.Getenv("STELLAR_USDC_ISSUER"),
@@ -88,8 +122,12 @@ func Load() (Config, error) {
 		LinqAPIURL:        os.Getenv("LINQ_API_URL"),
 		LinqAPISecret:     os.Getenv("LINQ_INTERNAL_SECRET"),
 		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
+		PublicAPIEnabled:  os.Getenv("PUBLIC_API_ENABLED") == "true",
+		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 
-		MerchantWebhookURL:    os.Getenv("MERCHANT_WEBHOOK_URL"),
+		PayoutNewReferenceOnRetry: os.Getenv("PAYOUT_NEW_REFERENCE_ON_RETRY") == "true",
+
+		MerchantWebhookURL:   os.Getenv("MERCHANT_WEBHOOK_URL"),
 		MerchantWebhookSecret: os.Getenv("MERCHANT_WEBHOOK_SECRET"),
 
 		HomeDomain:        os.Getenv("SEP10_HOME_DOMAIN"),
@@ -106,6 +144,12 @@ func Load() (Config, error) {
 		BaseFee:           integer("STELLAR_BASE_FEE", 0),
 		MaxStreams:        int(integer("STELLAR_MAX_STREAMS", 200)),
 		AccountPoolSize:   int(integer("STELLAR_ACCOUNT_POOL", 10)),
+
+		ReconcileInterval:          duration("RECONCILE_INTERVAL", 15*time.Minute),
+		ReconcileHorizonCalls:      int(integer("RECONCILE_HORIZON_CALLS", 200)),
+		ReconcilePayoutCalls:       int(integer("RECONCILE_PAYOUT_CALLS", 50)),
+		ReconcileSponsoredAccounts: os.Getenv("RECONCILE_SPONSORED_ACCOUNTS") == "true",
+		ReviewerToken:              os.Getenv("REVIEWER_TOKEN"),
 	}
 
 	var problems []string
@@ -129,6 +173,19 @@ func Load() (Config, error) {
 	}
 	if c.LinqAPISecret == "" {
 		problems = append(problems, "LINQ_INTERNAL_SECRET is required")
+	}
+	// A cycle reads hundreds of things from Horizon. Run back to back, it would
+	// spend the rate limit the settlement loops depend on.
+	if c.ReconcileInterval < time.Minute {
+		problems = append(problems, "RECONCILE_INTERVAL must be at least 1m")
+	}
+	if c.ReconcileHorizonCalls < 0 || c.ReconcilePayoutCalls < 0 {
+		problems = append(problems, "RECONCILE_HORIZON_CALLS and RECONCILE_PAYOUT_CALLS cannot be negative")
+	}
+	// The token is the page's only lock, and it is given to people outside the
+	// team. A short one could be guessed.
+	if c.ReviewerToken != "" && len(c.ReviewerToken) < minReviewerTokenLen {
+		problems = append(problems, fmt.Sprintf("REVIEWER_TOKEN must be at least %d characters; generate one with: openssl rand -hex 32", minReviewerTokenLen))
 	}
 
 	if len(problems) > 0 {

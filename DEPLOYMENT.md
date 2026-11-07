@@ -59,6 +59,123 @@ preflight, `stellar.toml` and SEP-10 all stay open to anyone, as designed. The
 `worker` binary never serves HTTP, so it neither needs nor reads this
 variable; setting it there is harmless but does nothing.
 
+### Public API (`server` only, both optional)
+
+| Variable | Default | What it is |
+|---|---|---|
+| `PUBLIC_API_ENABLED` | off | Serves `/v1` and `/admin` when exactly `true`. Orders taken on `/v1` move money, so this is the off switch: unset it and redeploy, and those routes stop existing whatever keys were issued. The legacy `/orders` routes do not depend on it |
+| (no variable) | | With the switch on, the integrator guide is served at `/docs` and the spec at `/docs/openapi.yaml`, unauthenticated. Sources are in `docs/api/`, embedded in the binary |
+| `ADMIN_API_KEY` | empty | Sent as `X-Admin-Key` to `/admin`. Empty refuses every admin request. Generate: `openssl rand -hex 32` |
+| `DB_MAX_OPEN_CONNS` | `20` | Connections the server may hold to Postgres, per instance. Keep instances x this below the database's `max_connections`, leaving room for the worker |
+
+Setting up an integrator (the full key appears once, in the second response):
+
+```bash
+curl -X POST $HOST/admin/integrators -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"name":"Acme"}'   # optional "rateLimitPerMinute"
+curl -X POST $HOST/admin/integrators/$INTEGRATOR_ID/keys -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+`POST /v1/orders` takes one of `amountNgn` or `amountUsdc` and no `rate`. This
+service prices the order from `GET /b2b/rate` on `LINQ_API_URL`, reused for up to
+30 seconds, and returns the rate it used. If that route cannot be reached, orders
+get 503 until it can. Sending `rate` or both amounts is a 400.
+
+The other admin routes are `PUT /admin/integrators/{id}/rate-limit`
+(`{"rateLimitPerMinute": 300}`, or `null` to go back to the default of 120),
+`POST /admin/keys/{id}/rotate`, `POST /admin/keys/{id}/revoke` and
+`GET /admin/credential-events` (`integratorId`, `keyId`, `limit`). Rate limit
+refusals are logged as `rate limit refused` with the key ID and time.
+
+To send an integrator its order events, give it a webhook. The reply has the
+signing secret, shown only this once:
+
+```bash
+curl -X PUT $HOST/admin/integrators/$INTEGRATOR_ID/webhook -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"url":"https://hooks.example.com/linq"}'   # "" clears it
+```
+
+Sending a new URL later moves the webhook and keeps the secret. To replace a
+secret, send `"rotateSecret": true` with the URL. That takes effect at once, with
+no overlap, and the reply holds the new secret.
+
+The URL must be https and public. An integrator with no webhook polls instead:
+its events are closed unreported, and setting a URL later does not replay them.
+Reports already owed when a webhook is cleared wait 24 hours for a new URL.
+Linq-B2B's webhook stays in `MERCHANT_WEBHOOK_URL` and can't be set here. Every
+attempt, for every integrator, is a row in `webhook_deliveries`.
+Revoking a key also revokes every key it was rotated to, because whoever holds a
+leaked key can rotate it. The reply lists them in `alsoRevoked`, and the owner
+then needs a newly issued key. `linq-b2b` can't hold issued keys.
+
+### Reconciliation (`worker` only, all optional)
+
+The worker checks the books against the ledger every 15 minutes, starting at
+boot, and records each cycle in `reconciliation_cycles` and each check in
+`reconciliation_items`. It only reads: a mismatch is written down, never acted
+on. A cycle logs `reconciliation cycle finished` with its counts, and each
+mismatch as `reconciliation mismatch`.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `RECONCILE_INTERVAL` | `15m` | Time between cycles, at least `1m` |
+| `RECONCILE_HORIZON_CALLS` | `200` | Horizon requests one cycle may make. Open deposit accounts get half of it first, taking turns across cycles when there are more than that, and whatever is left at the end. Finished orders get the rest, newest first. What a cycle cannot reach waits for the next one. Four cycles an hour at 200 is 800 requests, well inside Horizon's 3,600 an hour |
+| `RECONCILE_PAYOUT_CALLS` | `50` | `GET /internal/payout` requests one cycle may make to the Linq backend. An order is asked about under each payout reference it used, so a payout retried under new references costs one request per reference |
+| `RECONCILE_SPONSORED_ACCOUNTS` | off | Exactly `true` turns on the check for accounts the sponsor pays reserves for with no order or pool row behind them. **Leave it off on mainnet until you know no other service uses the same sponsor account** (Linq-v2 has a `STELLAR_SPONSOR_KEY` too): every account another service opens would be reported |
+
+To record why a mismatch is not a problem, or what was done about it:
+
+```bash
+curl -X POST $HOST/admin/reconciliation/items/$ITEM_ID/resolve -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"resolution":"Induced failure for the SD-11 demo","resolvedBy":"ify"}'
+```
+
+**This route only exists with `PUBLIC_API_ENABLED=true` on the server**, like
+every `/admin` route. That is deliberate: the switch turns off everything an
+admin key can do. With it off, mismatches are still recorded and shown on
+`/reconciliation`; they just can't be resolved until it is on.
+
+What a resolution does:
+
+- **It covers every copy of that problem.** An unexplained mismatch is recorded
+  again every cycle, and the note goes on all of its copies.
+- **A transaction check is then done.** Its answer can't change.
+- **Any other check keeps running**, because its answer can: a payout that was
+  "still in progress" can pay later. It records nothing while the answer is the
+  one explained, and a new mismatch, needing its own note, if the answer
+  changes.
+- **Resolving an error ("could not check") does not stop it being checked.** It
+  was never answered.
+- **A resolution cannot be rewritten.**
+
+With more than one worker instance, each runs its own cycles. That is safe,
+since the cycles only read, but it records each check twice.
+
+### Reconciliation page (`server` only, optional)
+
+`/reconciliation` shows a reviewer what the worker recorded: every cycle with
+its counts, each cycle's checks (filterable to mismatches) with their
+resolutions, every mismatch in one list, and a running total of completed
+cycles. Transactions and accounts link to Stellar Expert, on testnet or public
+to match `STELLAR_NETWORK_PASSPHRASE`. It is read-only, and reads only the two
+reconciliation tables, so it has no bank detail to show.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `REVIEWER_TOKEN` | empty | The one secret that opens the page. Empty means the page is not served at all. At least 32 characters, or the server refuses to start. Generate: `openssl rand -hex 32` |
+
+Give a reviewer the address and the token. They paste the token once; the
+browser keeps a cookie made from it (not the token itself) until it closes.
+Changing `REVIEWER_TOKEN` signs every reviewer out. A script can send the token
+as a header instead:
+
+```bash
+curl $HOST/reconciliation -H "Authorization: Bearer $REVIEWER_TOKEN"
+```
+
+The page does not depend on `PUBLIC_API_ENABLED`, and the token opens nothing
+else: not `/admin`, not `/v1`, not `/orders`.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 
@@ -123,6 +240,7 @@ key and nothing can sweep or reclaim them afterwards.
 | `STELLAR_MAX_STREAMS` | `200` | Concurrent Horizon streams; past this, orders fall back to polling |
 | `STELLAR_ACCOUNT_POOL` | `10` | Deposit accounts kept provisioned ahead of demand, so `POST /orders` costs a database round-trip instead of a ledger close. `0` disables it and returns to provisioning inline. Each waiting account holds ~1 XLM of sponsor reserves, returned when the account is merged back after settlement |
 | `STELLAR_BASE_FEE` | `10000` stroops | Headroom for network congestion |
+| `PAYOUT_NEW_REFERENCE_ON_RETRY` | off | `worker` only. When exactly `true`, a payout retry after a failure the Linq backend confirms as retry-safe (`retrySafe: true` on `GET /internal/payout`) uses a new reference (`<order>-p2`, `-p3`), so the retry really pays. A failure without that confirmation stops the order in `failed` for a person to check, instead of retrying or refunding. Off, every retry reuses the order ID and reads back the first failure, then refunds after three, as before |
 
 ### SEP-10 (optional, all three or none)
 

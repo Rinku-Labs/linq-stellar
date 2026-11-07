@@ -33,6 +33,9 @@ type Server struct {
 	// without it fee sponsorship would refuse every one of them. Optional: with
 	// no lookup configured only this service's own orders are sponsored.
 	DepositLookup DepositLookup
+	// Rates prices orders taken on /v1. Nil refuses them: there is no other rate
+	// an issued key's order may use.
+	Rates RateSource
 
 	HomeDomain    string
 	DepositWindow time.Duration
@@ -44,7 +47,18 @@ type Server struct {
 	// SEP-10 is its own authentication. Required by cmd/server before it will
 	// listen — never zero-value in a running server.
 	OrdersAPIKey string
-	Log          *slog.Logger
+	// PublicAPIEnabled serves /v1 and /admin. Off by default, because an order
+	// taken on /v1 moves money: switching it off removes the routes outright,
+	// whatever keys exist, and the legacy routes do not depend on it.
+	PublicAPIEnabled bool
+	// AdminAPIKey guards /admin. Empty refuses every admin request.
+	AdminAPIKey string
+	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// page is not served at all.
+	ReviewerToken string
+	// Now is the clock for credentials and rate limits. Nil means time.Now.
+	Now func() time.Time
+	Log *slog.Logger
 	// Wake tells the worker deployment there is something to do — a new order
 	// to watch, a pooled account to replace. Optional: without it the worker
 	// still finds both on its next pass.
@@ -65,7 +79,7 @@ func (s *Server) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusUnauthorized, "invalid or missing X-API-Key")
 			return
 		}
-		next(w, r)
+		next(w, withCaller(r, caller{integratorID: store.LegacyIntegratorID}))
 	}
 }
 
@@ -91,6 +105,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /stellar/submit", s.handleSubmit)
 	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
+
+	if s.ReviewerToken != "" {
+		s.reconciliationRoutes(mux)
+	}
+	if s.PublicAPIEnabled {
+		s.publicRoutes(mux)
+	}
 
 	// Preflight for the routes browsers call cross-origin. Registered
 	// explicitly because ServeMux matches on method, so an OPTIONS request
@@ -212,7 +233,13 @@ type DepositLookup interface {
 	LookupDepositAddress(address string) (payout.KnownDepositAddress, error)
 }
 
-// CreateOrderRequest is the payload for a new Stellar off-ramp order.
+// RateSource is the NGN per USDC this service quotes at.
+type RateSource interface {
+	Rate() (float64, error)
+}
+
+// CreateOrderRequest is the payload for a new Stellar off-ramp order. On /v1 the
+// caller sends one amount and no rate; see refuseCallerQuote.
 type CreateOrderRequest struct {
 	AmountNGN      float64 `json:"amountNgn"`
 	AmountUSDC     float64 `json:"amountUsdc"`
@@ -235,7 +262,14 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if err := validateCreate(req); err != nil {
+	ownQuote := callerOf(r).legacy()
+	if !ownQuote {
+		if err := refuseCallerQuote(req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := validateCreate(req, ownQuote); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -243,9 +277,9 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	// Idempotency first: a retried create must return the original order rather
 	// than provision a second deposit account and leave the first stranded.
 	var existing store.Order
-	err := s.DB.Where("idempotency_key = ?", req.IdempotencyKey).First(&existing).Error
+	err := s.DB.Omit("encrypted_seed").Where("integrator_id = ? AND idempotency_key = ?", integratorID(r), req.IdempotencyKey).First(&existing).Error
 	if err == nil {
-		s.writeOrder(w, http.StatusOK, &existing)
+		s.writeOrder(w, r, http.StatusOK, &existing)
 		return
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -264,6 +298,20 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// After the idempotency check, so a retry keeps the rate it was first quoted
+	// and costs no fetch. A rate that cannot be had stops the order here, before
+	// anything is provisioned.
+	rate := req.Rate
+	if !ownQuote {
+		rate, err = s.currentRate()
+		if err != nil {
+			s.Log.Error("could not get a rate for an order", "integrator", integratorID(r), "error", err)
+			writeError(w, http.StatusServiceUnavailable,
+				"could not get the current rate right now; try again shortly")
+			return
+		}
+	}
+
 	// The quote, struck before anything is provisioned. Whichever side the
 	// caller supplied, the other is derived here and both are then fixed for
 	// the life of the order.
@@ -278,7 +326,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	// already paid the reserves for an account nobody would ever fund.
 	amountUSDC, amountNGN := req.AmountUSDC, req.AmountNGN
 	if amountUSDC == 0 {
-		amountUSDC, err = money.QuoteUSDC(amountNGN, req.Rate)
+		amountUSDC, err = money.QuoteUSDC(amountNGN, rate)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -289,7 +337,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		amountUSDC = money.CeilUSDC(amountUSDC)
 	}
 	if amountNGN == 0 {
-		amountNGN = money.QuoteNGN(amountUSDC, req.Rate)
+		amountNGN = money.QuoteNGN(amountUSDC, rate)
 	} else {
 		amountNGN = money.RoundNGN(amountNGN)
 	}
@@ -306,6 +354,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 
 	order := store.Order{
 		ID:              orderID,
+		IntegratorID:    integratorID(r),
 		BusinessID:      req.BusinessID,
 		IdempotencyKey:  req.IdempotencyKey,
 		CustomerRef:     req.CustomerRef,
@@ -314,7 +363,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		AmountNGN:       amountNGN,
 		QuotedUSDC:      amountUSDC,
 		QuotedNGN:       amountNGN,
-		Rate:            req.Rate,
+		Rate:            rate,
 		FeeUSDC:         0, // Stellar is the zero-fee rail; stored, not implied
 		DepositAddress:  deposit.Address,
 		EncryptedSeed:   deposit.EncryptedSeed,
@@ -360,7 +409,14 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	// looking at the address and may already have sent to it.
 	s.Wake.Signal(wake.Deposits)
 
-	s.writeOrder(w, http.StatusCreated, &order)
+	s.writeOrder(w, r, http.StatusCreated, &order)
+}
+
+func (s *Server) currentRate() (float64, error) {
+	if s.Rates == nil {
+		return 0, errors.New("no rate source is configured")
+	}
+	return s.Rates.Rate()
 }
 
 // depositAccount is where an order's Stellar address comes from.
@@ -441,11 +497,24 @@ type depositAccount struct {
 
 func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 	var order store.Order
-	if err := s.DB.First(&order, "id = ?", r.PathValue("id")).Error; err != nil {
+	if err := s.DB.Omit("encrypted_seed").First(&order, "id = ? AND integrator_id = ?", r.PathValue("id"), integratorID(r)).Error; err != nil {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
-	s.writeOrder(w, http.StatusOK, &order)
+	if callerOf(r).keyID == "" { // the legacy shared key
+		s.writeOrder(w, r, http.StatusOK, &order)
+		return
+	}
+	// /v1 also lists every payout reference used, so an integrator can see a
+	// retry was a new payout. The legacy route's body stays as it was.
+	attempts, err := store.PayoutAttempts(s.DB, order.ID)
+	if err != nil {
+		s.Log.Warn("could not load payout attempts", "order", order.ID, "error", err)
+	}
+	if attempts == nil {
+		attempts = []store.PayoutAttempt{}
+	}
+	s.writeOrderWith(w, r, http.StatusOK, &order, map[string]any{"payoutAttempts": attempts})
 }
 
 // writeOrder renders an order along with the SEP-7 URI a wallet can scan.
@@ -454,7 +523,12 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 // knows the destination, asset, amount and memo. A frontend that assembled it
 // would be reconstructing facts it had to be told, and would be the second
 // place a wrong asset issuer could creep in.
-func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
+func (s *Server) writeOrder(w http.ResponseWriter, r *http.Request, status int, o *store.Order) {
+	s.writeOrderWith(w, r, status, o, nil)
+}
+
+// writeOrderWith is writeOrder with extra fields added to the body.
+func (s *Server) writeOrderWith(w http.ResponseWriter, r *http.Request, status int, o *store.Order, extra map[string]any) {
 	payload := map[string]any{
 		"id":             o.ID,
 		"status":         o.Status,
@@ -495,12 +569,6 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	if destination := refundDestination(o); destination != "" {
 		payload["refundDestination"] = destination
 	}
-	// The reason an order is where it is, taken from the move that put it
-	// there. It is recorded on the transition rather than the order, because an
-	// order carries one status and a history carries every explanation.
-	if reason := latestReason(s.DB, o.ID); reason != "" {
-		payload["statusReason"] = reason
-	}
 	// Only present when it happened, so a caller cannot mistake the ordinary
 	// false for "we checked and it was fine" on an order predating the check.
 	if o.Underpaid {
@@ -525,11 +593,23 @@ func (s *Server) writeOrder(w http.ResponseWriter, status int, o *store.Order) {
 	if events, err := store.StatusHistory(s.DB, o.ID); err != nil {
 		s.Log.Warn("could not load status history", "order", o.ID, "error", err)
 	} else if len(events) > 0 {
+		if !callerOf(r).legacy() {
+			usePublicReasons(events)
+		}
 		payload["statusHistory"] = events
 		first, last := events[0].At, events[len(events)-1].At
 		payload["statusHistorySeconds"] = last.Sub(first).Seconds()
+		// The reason an order is where it is, taken from the move that put it
+		// there. It is recorded on the transition rather than the order, because
+		// an order carries one status and a history carries every explanation.
+		if reason := latestReason(events); reason != "" {
+			payload["statusReason"] = reason
+		}
 	}
 
+	for k, v := range extra {
+		payload[k] = v
+	}
 	writeJSON(w, status, payload)
 }
 
@@ -552,13 +632,42 @@ func (s *Server) paymentURI(o *store.Order) (string, error) {
 	return s.URISigner.Sign(uri)
 }
 
-func validateCreate(r CreateOrderRequest) error {
+const maxIdempotencyKeyLength = 255
+
+// refuseCallerQuote keeps the exchange rate out of a /v1 caller's hands.
+// Settlement pays QuotedNGN once QuotedUSDC arrives, so whoever sets the rate, or
+// both sides of the quote, decides what a deposit is worth: 0.01 USDC against
+// ₦10,000,000 would otherwise be a valid order. A rate is refused rather than
+// ignored so a caller never believes it locked a figure it did not.
+//
+// manualDeposit goes too: it pays for whatever arrives at the locked rate, which
+// would be a free option against Linq, of any size, for the whole deposit window.
+func refuseCallerQuote(r CreateOrderRequest) error {
+	switch {
+	case r.ManualDeposit:
+		return errors.New("manualDeposit is not available on this API")
+	case r.Rate != 0:
+		return errors.New("rate is set by this service; leave it out")
+	case r.AmountNGN > 0 && r.AmountUSDC > 0:
+		return errors.New("send one of amountNgn or amountUsdc, not both")
+	}
+	return nil
+}
+
+func validateCreate(r CreateOrderRequest, rateRequired bool) error {
 	switch {
 	case r.IdempotencyKey == "":
 		return errors.New("idempotencyKey is required")
+	case len(r.IdempotencyKey) > maxIdempotencyKeyLength:
+		// The column's size. Caught here, because at the INSERT a deposit
+		// account has already been taken or paid for.
+		return errors.New("idempotencyKey is too long")
+	case r.AmountNGN < 0 || r.AmountUSDC < 0:
+		// A negative quote is covered by any deposit.
+		return errors.New("amounts cannot be negative")
 	case r.AmountNGN <= 0 && r.AmountUSDC <= 0:
 		return errors.New("one of amountNgn or amountUsdc is required")
-	case r.Rate <= 0:
+	case rateRequired && r.Rate <= 0:
 		return errors.New("rate is required")
 	case r.BankCode == "":
 		return errors.New("bankCode is required")
@@ -708,20 +817,27 @@ func refundDestination(o *store.Order) string {
 	return o.DepositFrom
 }
 
+// usePublicReasons replaces each move's stored reason with what an integrator may
+// see. Notification rows stay: they describe deliveries to its own endpoint.
+func usePublicReasons(events []store.StatusEvent) {
+	for i := range events {
+		if events[i].Kind == store.KindTransition {
+			events[i].Reason = store.PublicReason(events[i].To, events[i].Reason)
+		}
+	}
+}
+
 // latestReason returns the explanation attached to this order's most recent
-// transition, if it had one.
+// transition, if it had one. events are oldest first, as StatusHistory returns
+// them.
 //
 // Only transitions: a notification row names the status it reported, and its
 // reason is about a delivery attempt rather than about the order.
-func latestReason(db *gorm.DB, orderID string) string {
-	var event store.StatusEvent
-	err := db.
-		Where("order_id = ? AND kind = ?", orderID, store.KindTransition).
-		Where("reason <> ''").
-		Order("at DESC, id DESC").
-		First(&event).Error
-	if err != nil {
-		return ""
+func latestReason(events []store.StatusEvent) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Kind == store.KindTransition && events[i].Reason != "" {
+			return events[i].Reason
+		}
 	}
-	return event.Reason
+	return ""
 }

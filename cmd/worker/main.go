@@ -14,15 +14,18 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Rinku-Labs/linq-stellar/internal/config"
 	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/pool"
+	"github.com/Rinku-Labs/linq-stellar/internal/reconcile"
 	"github.com/Rinku-Labs/linq-stellar/internal/settle"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"github.com/Rinku-Labs/linq-stellar/internal/wake"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -92,7 +95,7 @@ func run() error {
 		Log:     log.With("component", "settle"),
 	}
 
-	// Six loops, run together. The streamer detects deposits in about a
+	// Eight loops, run together. The streamer detects deposits in about a
 	// second; the scanner is the backstop that catches whatever the streamer
 	// dropped across a reconnect. Both enter settlement through the same claim.
 	// The notifier is what tells the Linq backend any of it happened.
@@ -112,6 +115,7 @@ func run() error {
 		}).Run,
 		(&payout.Worker{
 			DB: db, Provider: provider, Log: log.With("component", "payout"), Bus: bus,
+			NewReferenceOnRetry: cfg.PayoutNewReferenceOnRetry,
 		}).Run,
 		(&settle.ChainWorker{
 			DB: db, Chain: chain, Treasury: cfg.TreasuryWallet,
@@ -122,7 +126,9 @@ func run() error {
 			Log:    log.With("component", "notify"),
 			URL:    cfg.MerchantWebhookURL,
 			Secret: cfg.MerchantWebhookSecret,
-			Bus:    bus,
+			// EncryptSeed and DecryptSeed seal any secret, under ENCRYPTION_KEY.
+			OpenSecret: chain.DecryptSeed,
+			Bus:        bus,
 		}).Run,
 		// Sixth: the pool keeper. It is the only loop that does no work for an
 		// order already in flight — it works for the next one, so that accepting
@@ -131,6 +137,18 @@ func run() error {
 			DB: db, Chain: chain, Log: log.With("component", "pool"),
 			Size: cfg.AccountPoolSize, Bus: bus,
 		}).Run,
+		// Seventh: credential housekeeping, which touches no order. Nothing
+		// signals it; there is nothing here anyone is waiting for.
+		wake.Loop{
+			Name:     "housekeeping",
+			Interval: housekeepingInterval,
+			Log:      log.With("component", "housekeeping"),
+			Work:     housekeeping(db, log.With("component", "housekeeping")),
+		}.Run,
+		// Eighth: reconciliation. It reads the ledger and the payout provider
+		// and writes down what it finds; it moves no money and changes no
+		// order. It runs once at boot, then on its own interval.
+		reconciliation(db, chain, provider, cfg, log.With("component", "reconcile")),
 	}
 
 	log.Info("worker starting",
@@ -157,6 +175,69 @@ func run() error {
 	log.Info("shutting down; waiting for workers to finish their current pass")
 	wg.Wait()
 	return nil
+}
+
+// housekeepingInterval is how often counters are pruned and key expiries are
+// written down. Neither is urgent: a counter is only read in its own minute, and
+// an expired key is refused whether or not its event exists yet.
+const housekeepingInterval = 5 * time.Minute
+
+// housekeeping is one pass of the credential upkeep: write the `expired` event
+// for keys that have lapsed, and delete rate counters and the delivery log past
+// their retention.
+func housekeeping(db *gorm.DB, log *slog.Logger) func(context.Context) bool {
+	return func(context.Context) bool {
+		now := time.Now().UTC()
+		expired, err := store.RecordExpiredKeys(db, now)
+		if err != nil {
+			log.Error("could not record expired keys", "error", err)
+		}
+		pruned, err := store.PruneRateCounters(db, now)
+		if err != nil {
+			log.Error("could not prune rate counters", "error", err)
+		}
+		deliveries, err := store.PruneWebhookDeliveries(db, now)
+		if err != nil {
+			log.Error("could not prune webhook deliveries", "error", err)
+		}
+		if expired > 0 || pruned > 0 || deliveries > 0 {
+			log.Info("housekeeping pass", "keysExpired", expired, "countersPruned", pruned,
+				"deliveriesPruned", deliveries)
+		}
+		// Always "worked": this loop keeps its interval rather than backing off.
+		return true
+	}
+}
+
+// reconciliation is the reconciliation loop. Its interval is fixed rather
+// than widening while quiet, because the record of cycles running on schedule
+// is part of what it is for.
+func reconciliation(db *gorm.DB, chain *stellar.Client, payouts reconcile.Payouts,
+	cfg config.Config, log *slog.Logger) func(context.Context) {
+	engine := &reconcile.Engine{
+		DB:             db,
+		Ledger:         chain,
+		Payouts:        payouts,
+		Treasury:       cfg.TreasuryWallet,
+		HorizonCalls:   cfg.ReconcileHorizonCalls,
+		PayoutCalls:    cfg.ReconcilePayoutCalls,
+		CheckSponsored: cfg.ReconcileSponsoredAccounts,
+		Log:            log,
+	}
+	return wake.Loop{
+		Name:     "reconcile",
+		Interval: cfg.ReconcileInterval,
+		Log:      log,
+		Fields: []any{"horizonCalls", cfg.ReconcileHorizonCalls, "payoutCalls", cfg.ReconcilePayoutCalls,
+			"sponsoredAccounts", cfg.ReconcileSponsoredAccounts},
+		Work: func(ctx context.Context) bool {
+			if _, err := engine.RunCycle(ctx); err != nil {
+				log.Error("could not run a reconciliation cycle", "error", err)
+			}
+			// Always "worked": the loop keeps its interval.
+			return true
+		},
+	}.Run
 }
 
 // waker turns "an order moved" into "wake whoever owns what comes next".

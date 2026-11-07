@@ -1,0 +1,6 @@
+POST /api/webhooks/stellar
+Accept-Encoding: gzip
+Content-Type: application/json
+User-Agent: Go-http-client/1.1
+
+{"event":"order.refund_queued","orderId":"ord_golden","status":"refund_queued","amountNGN":9940,"amountStableCoin":6.1,"txHash":"deposit-tx","underpaid":true,"shortfallNgn":60,"quotedNgn":10000,"quotedStableCoin":6.14,"payoutReference":"payout-ref","payoutProvider":"provider-a","refundTxHash":"refund-tx","sweepTxHash":"sweep-tx","depositAddress":"GDEPOSIT","refundDestination":"GPAYER","reason":"account closed","occurredAt":"2026-11-06T12:00:00Z","timestamp":"<sent>"}

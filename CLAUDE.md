@@ -122,6 +122,168 @@ sweep or a refund, resending moves money twice.
 Fee bumps are exempt — a fee account does not spend a sequence number — which is
 why `FeeBumpAndSubmit` submits directly.
 
+## Integrators, keys and rate limits
+
+`/v1` and `/admin` live in `internal/api/public.go` and are only served when
+`PUBLIC_API_ENABLED=true`. `/v1/orders` runs the same handlers as `/orders`; the
+caller comes from the request context, so the two cannot drift apart.
+
+- **An integrator is the caller; `Order.BusinessID` is the merchant.** Do not
+  reuse one for the other. Every order query a caller can reach filters on
+  `integrator_id`. `ORDERS_API_KEY` maps to `store.LegacyIntegratorID`, which is
+  also the column default, so a row written without one belongs to Linq-B2B.
+- **An issued key never sets the rate.** Settlement pays `QuotedNGN` once
+  `QuotedUSDC` arrives, so whoever sets the rate decides what a deposit is
+  worth: 0.01 USDC against ₦10,000,000 passes every other check. On `/v1` a
+  `rate`, or both amounts, is a 400; the rate comes from `Server.Rates`
+  (`GET /b2b/rate` on the Linq backend, held `payout.RateMaxAge`). No rate
+  means no order: never fall back to a stale or supplied one. Only the legacy
+  key sends a rate, which Linq-B2B fetches from that same route.
+  `manualDeposit` is legacy-only for the same reason: it pays for whatever
+  arrives at the locked rate.
+- **A key is never stored or logged.** Only `key_prefix` and a SHA-256 of the
+  whole key. `writeIssuedKey` is the one place a full key leaves the service.
+- **`credential_events` is the rotation and revocation proof, and a Postgres
+  trigger makes it append-only.** Any new way to
+  change a key must write a row there, in the same transaction as the change.
+- **A key inside its rotation overlap cannot rotate again.** Otherwise a leaked
+  key could mint a successor and outlive the rotation.
+- **Revoking a key revokes everything it rotated to.** A leaked key can rotate
+  once, so its successor is just as compromised.
+- **`linq-b2b` cannot hold an issued key.** All its orders are under that one
+  integrator, so a key there would read every one of them.
+- **Rejected keys write one row per key, action and minute, and log every use.**
+  They skip the rate limit and `credential_events` can't be cleaned up, so never
+  write a row per request or scan on the request path.
+- **The limit is counted after authentication, by key, never by address.**
+  Counting first would let anyone who has seen a prefix lock its owner out. The
+  legacy routes have no key row, so they carry no limit.
+- **The counter is one atomic upsert per request** (`HitRateCounter`), in
+  Postgres so it holds across instances. A read then a write would let
+  concurrent requests through. If it cannot be written the request gets 503: the
+  limit never silently stops applying.
+- **`docs/api/` is held to the code by `internal/api/docs_test.go`.** A new `/v1`
+  route, reply field or status fails there until it is documented.
+- **`rate limit refused` log lines are the proof of enforcement.** Counter rows
+  are gone within the hour, so nothing else records a refusal.
+
+## Webhooks go to whoever created the order
+
+`internal/notify` works one lane per integrator. Linq-B2B's lane uses
+`MERCHANT_WEBHOOK_URL` and `MERCHANT_WEBHOOK_SECRET`, and its deliveries must not
+change: `testdata/legacy_delivery.golden` was captured from the code before
+lanes existed. Never regenerate it to make a test pass.
+
+- **A lane exists so one endpoint can't hold up the others.** Delivering
+  sequentially, a hanging endpoint costs everyone behind it the timeout per event.
+- **An integrator's URL is untrusted, and the worker calls it from inside our
+  network.** `NewIntegratorClient` refuses non-public addresses at dial time,
+  after DNS, and follows no redirects. Send to these URLs with no other client.
+- **An integrator's delivery is never unsigned.** No secret means no delivery,
+  and the report stays owed.
+- **A failing integrator gets one attempt per backoff, not one per event.**
+  Linq-B2B keeps its old behaviour of trying each event.
+- **An integrator never sees a stored reason.** It quotes payout providers and
+  internal URLs. `store.PublicReason` is what the webhook and `/v1` show, and a
+  state with no message there shows nothing. Linq-B2B keeps the raw text.
+- **Log and store the host, never the URL.** A path can carry the integrator's
+  token, and `cleanError` removes it from errors.
+- **`owedEvents` is the query and the index predicate, word for word.** Change
+  one and the sweep falls back to reading most of the table. Adding a state to
+  `notifiable` means adding it there, and replacing the index.
+
+## Payout attempts and references
+
+Each try at a payout is a `store.PayoutAttempt`, written before the request is
+sent. Its reference is the idempotency key Linq sees: the order ID, then
+`<order>-p2`, `-p3` when `PAYOUT_NEW_REFERENCE_ON_RETRY=true`.
+
+- **A new reference only after a confirmed, retry-safe failure.** The
+  confirmation is `GET /internal/payout` saying `failed` with
+  `retrySafe: true`. A `failed` from the POST, a timeout, an error or `queued`
+  means resend the same reference later (`wait`). Linq reports `failed` for
+  some outcomes the bank never confirmed, such as an HTTP 5xx from the bank, so
+  `failed` alone is not proof that no money moved.
+- **An unknown outcome never refunds and never counts as an attempt.** The
+  order goes back to `payout_queued` with `payout_after` 30 seconds out.
+- **With the switch on, a failure that is not retry-safe goes to `failed`** for
+  a person. A retry could pay twice, and a refund on top of a payout that went
+  through pays the payer twice.
+- **Induced failures** (`POST /admin/orders/{id}/induce-payout-failure`) are
+  for Linq's own test orders. They need `integrators.allow_failure_injection`,
+  which has no route and is set in the database. An induced attempt is recorded
+  with reason `induced for demonstration` and never reaches the provider.
+
+## Reconciliation reads and records, never acts
+
+`internal/reconcile` checks the order table against Horizon and the Linq backend
+every cycle and writes each result to `reconciliation_items`. A mismatch is a
+note for a person, never a trigger. The engine is given a `Ledger` and a
+`Payouts` that can only read, and it updates no order: keep it that way. An
+engine that "fixed" a balance it had misread would move money on a bug.
+
+- **The cycle row comes first and the counts last.** `RunCycle` writes the cycle
+  before checking anything, items as they are found, and the counts and error
+  in a deferred finish, so a cycle that stops partway still says what it
+  checked and why it stopped.
+- **A passed check is final; a resolution covers only the answer it explained.**
+  The ledger does not change a confirmed transaction (`SettledChecks`). A
+  mismatch is recorded again every cycle until someone resolves it with
+  `POST /admin/reconciliation/items/{id}/resolve`, which writes once and covers
+  every copy of that problem. A resolved transaction check is done
+  (`finalOnceResolved`). Every other check keeps running, records nothing while
+  its answer is the one explained (`ExplainedAlready`), and records a new
+  mismatch when it changes: a refunded order's payout explained as "pending"
+  that later pays must be flagged. A resolved error settles nothing.
+- **Look twice before recording a mismatch that could be the order moving.**
+  A deposit seen a second before the detector claims it is not a missed
+  deposit. Re-read the order and record nothing if it moved.
+- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`).
+  Open accounts get half the Horizon budget first and the leftovers last, and
+  take turns from where the last cycle stopped (`Engine.openAfter`), so a long
+  list of them can't starve the finished orders. Finished orders go newest
+  first. A Horizon rate-limit refusal stops the cycle's Horizon checks rather
+  than spending the rest of the budget being refused.
+- **The sponsored-account check stays behind `RECONCILE_SPONSORED_ACCOUNTS`.**
+  Pool accounts count as known. If another service opens accounts with the same
+  sponsor, every one of them would be reported.
+- **The payout check asks about every reference an order sent**, from its
+  `stellar_payout_attempts` (`payoutRefs`): the last must be paid on a paid
+  order, and no other may be, or the merchant may have been paid twice. None may
+  be paid on a refunded order. Induced attempts never reached Linq and are not
+  asked about; an order with no attempts on record is asked about by its ID.
+  An order's references are asked about together or not at all in a cycle.
+  The amount is compared when the Linq backend's `GET /internal/payout` sends
+  `amountNGN` (naira), which Linq-v2 #105 adds; until then the item says
+  "amount not reported".
+- **`expected` and `actual` are read by reviewers.** Never put bank details in
+  them.
+
+## The reconciliation page is for people outside Linq
+
+`/reconciliation` (`internal/api/reconciliation_page.go`) shows a reviewer the
+cycles and items, and is opened with `REVIEWER_TOKEN` alone. It is only served
+when that is set.
+
+- **It reads the reconciliation tables and nothing else.** That is why it can
+  promise no bank detail: the items were written without any. Do not join it to
+  `orders` to show more; a merchant's account number is one join away.
+- **The cookie holds an HMAC of a fixed label under the token, never the
+  token.** It proves the browser was given the token, and stops working when the
+  token changes. Compare with `sameSecret`, which hashes both sides before a
+  constant-time compare so a length leaks nothing either.
+- **The token opens this page only.** Not `/admin`, not `/v1`. Keep it a
+  separate secret from `ADMIN_API_KEY`: a reviewer is given it.
+- **`html/template`, never `text/template`.** `expected`, `actual` and a
+  resolution are free text, and a resolution is typed by a person.
+- **No scripts.** The CSP is `default-src 'none'`, and the overview refreshes
+  with a meta tag. Adding JavaScript means changing the CSP on purpose.
+- **It counts and lists problems, not copies.** An unexplained mismatch is
+  recorded again every cycle, so the overview's counts and the mismatch list
+  group items by `problemKey` (order, account, check, answer). A problem is
+  resolved when any copy has a note. Each cycle's own page still shows every
+  item it recorded.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every
@@ -143,3 +305,9 @@ go build ./... && go vet ./... && go test ./...
 No database, network or keys needed. `TestQuotingAndSettlingRoundTripsExactly`
 is the invariant: quote an invoice, pay exactly that quote, merchant receives
 the invoice to the kobo.
+
+The store tests also run against Postgres when `LINQ_TEST_PG_DSN` points at a
+local database (key=value form, e.g. `host=127.0.0.1 user=postgres
+password=postgres dbname=linqtest sslmode=disable`). SQLite misses migration
+races and Postgres-only constraints, so run them there before merging anything
+that touches the schema or a store query.

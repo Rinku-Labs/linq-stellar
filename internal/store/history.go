@@ -60,6 +60,9 @@ type StatusEvent struct {
 	// NotifiedAt is when this transition was successfully reported. Nil means
 	// still owed.
 	NotifiedAt *time.Time `gorm:"index" json:"notifiedAt,omitempty"`
+	// NotifySkippedAt is when this transition was closed unreported, because its
+	// integrator has no webhook.
+	NotifySkippedAt *time.Time `json:"-"`
 	// NotifyAttempts counts failed deliveries of this transition.
 	NotifyAttempts int `gorm:"default:0" json:"-"`
 	// NotifyAfter holds off the next attempt after a failure.

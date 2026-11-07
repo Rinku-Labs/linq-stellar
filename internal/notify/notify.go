@@ -1,4 +1,5 @@
-// Package notify delivers order status changes to the Linq backend.
+// Package notify delivers order status changes to whoever created the order: the
+// Linq backend for Linq-B2B's orders, and each integrator's own webhook for theirs.
 //
 // This service settles Stellar payments on its own: it watches Horizon, pays
 // the merchant and sweeps the deposit, without anything upstream driving it.
@@ -25,10 +26,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -51,6 +57,13 @@ const (
 	// the event and send mail asynchronously, not to finish that work while
 	// this connection is held open.
 	deliveryTimeout = 15 * time.Second
+
+	// maxConcurrentIntegrators bounds the lanes running at once, and so the
+	// database connections a sweep can hold.
+	maxConcurrentIntegrators = 8
+
+	// maxErrorLength bounds what a receiver can put in the delivery log.
+	maxErrorLength = 500
 )
 
 // notifiable is the set of states worth telling the Linq backend about.
@@ -125,13 +138,20 @@ type Worker struct {
 	Log  *slog.Logger
 	HTTP *http.Client
 
-	// URL is the Linq backend's Stellar webhook endpoint. Empty disables
-	// delivery entirely, which is what a local or test deployment wants.
+	// URL is the Linq backend's Stellar webhook endpoint, for Linq-B2B's orders.
+	// Empty leaves those undelivered and still owed, which is what a local or
+	// test deployment wants.
 	URL string
-	// Secret signs the body. Empty means unsigned, which the receiver is free
-	// to reject; it is left possible only so a development receiver can run
-	// without one.
+	// Secret signs those deliveries. Empty means unsigned, which the receiver is
+	// free to reject; it is left possible only so a development receiver can run
+	// without one. An integrator's own deliveries are always signed.
 	Secret string
+
+	// IntegratorHTTP sends to integrators' URLs. Nil means NewIntegratorClient.
+	// It is separate from HTTP because those URLs are not ours.
+	IntegratorHTTP *http.Client
+	// OpenSecret decrypts a stored webhook secret.
+	OpenSecret func(sealed string) (string, error)
 
 	Interval time.Duration
 	Batch    int
@@ -141,16 +161,37 @@ type Worker struct {
 	// had drifted to while the service was quiet — a minute and a quarter, in
 	// the run that prompted this.
 	Bus *wake.Bus
+
+	// pausedUntil holds off integrators whose endpoint just failed. In memory on
+	// purpose: a restart costs one extra attempt each.
+	pausedMu    sync.Mutex
+	pausedUntil map[string]time.Time
+}
+
+// target is where one integrator's events go.
+type target struct {
+	integratorID string
+	url          string
+	// logURL is what may be logged. An integrator's path can carry a token, so
+	// that is the host alone.
+	logURL string
+	host   string
+	secret string
+	client *http.Client
+	// legacy is Linq-B2B, whose deliveries must not change.
+	legacy bool
 }
 
 // Run delivers pending notifications until the context is cancelled.
 func (w *Worker) Run(ctx context.Context) {
 	if w.URL == "" {
-		w.Log.Warn("merchant notifier disabled: no webhook url configured")
-		return
+		w.Log.Warn("no merchant webhook url configured: linq-b2b orders are not being reported")
 	}
 	if w.HTTP == nil {
 		w.HTTP = &http.Client{Timeout: deliveryTimeout}
+	}
+	if w.IntegratorHTTP == nil {
+		w.IntegratorHTTP = NewIntegratorClient()
 	}
 	interval := w.Interval
 	if interval <= 0 {
@@ -163,7 +204,6 @@ func (w *Worker) Run(ctx context.Context) {
 		Interval: interval,
 		Bus:      w.Bus,
 		Log:      w.Log,
-		Fields:   []any{"url", w.URL},
 		Work:     w.sweep,
 	}.Run(ctx)
 }
@@ -180,42 +220,195 @@ func (w *Worker) sweep(ctx context.Context) (found bool) {
 		batch = defaultBatch
 	}
 
-	states := make([]string, 0, len(notifiable))
-	for s := range notifiable {
-		states = append(states, s)
-	}
-
-	// Owed transitions, oldest first — not orders whose current status differs
-	// from what was reported. The difference matters: an order that passes
-	// through a reportable state faster than this loop runs still owes that
-	// report, and ordering by when the move happened means the merchant reads
-	// the story in the order it occurred rather than only its ending.
-	var events []store.StatusEvent
-	if err := w.DB.
-		Where("kind = ?", store.KindTransition).
-		// Quoted: "to" is a reserved word, and the column is named for the
-		// struct field rather than around SQL's vocabulary.
-		Where(`"to" IN ?`, states).
-		Where("notified_at IS NULL").
-		Where("notify_after IS NULL OR notify_after <= ?", time.Now().UTC()).
-		Order("at ASC, id ASC").
-		Limit(batch).
-		Find(&events).Error; err != nil {
+	now := time.Now().UTC()
+	integrators, err := store.OwedIntegrators(w.DB, now)
+	if err != nil {
 		w.Log.Error("notify sweep query failed", "error", err)
 		return false
 	}
 
+	// One lane per integrator, so a slow or dead endpoint holds up nobody else.
+	// An endpoint that hangs would otherwise cost every other integrator, and
+	// Linq-B2B, fifteen seconds per event in the queue ahead of them.
+	var lanes sync.WaitGroup
+	var worked atomic.Bool
+	slots := make(chan struct{}, maxConcurrentIntegrators)
+	for _, id := range integrators {
+		if w.isPaused(id, now) || (id == store.LegacyIntegratorID && w.URL == "") {
+			continue
+		}
+		lanes.Add(1)
+		slots <- struct{}{}
+		go func() {
+			defer lanes.Done()
+			defer func() { <-slots }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					w.Log.Error("notify lane panicked", "integrator", id, "panic", rec)
+				}
+			}()
+			if w.deliverFor(ctx, id, batch) {
+				worked.Store(true)
+			}
+		}()
+	}
+	lanes.Wait()
+	return worked.Load()
+}
+
+// deliverFor works through one integrator's owed transitions, oldest first —
+// not orders whose current status differs from what was reported. The difference
+// matters: an order that passes through a reportable state faster than this loop
+// runs still owes that report, and ordering by when the move happened means the
+// merchant reads the story in the order it occurred rather than only its ending.
+func (w *Worker) deliverFor(ctx context.Context, integratorID string, batch int) (found bool) {
+	dest, ok := w.targetFor(integratorID)
+	if !ok {
+		return false
+	}
+
+	events, err := store.OwedEventsFor(w.DB, integratorID, time.Now().UTC(), batch)
+	if err != nil {
+		w.Log.Error("notify lane query failed", "integrator", integratorID, "error", err)
+		return false
+	}
 	for i := range events {
 		if ctx.Err() != nil {
-			return len(events) > 0
+			break
 		}
-		w.deliverEvent(ctx, &events[i])
+		wait, delivered := w.deliverEvent(ctx, &events[i], dest)
+		// A failing endpoint gets one attempt per backoff, not one per event. A
+		// backlog would otherwise write a delivery row every few seconds for as
+		// long as the endpoint stays down.
+		if !delivered && !dest.legacy {
+			w.pause(integratorID, wait)
+			break
+		}
 	}
 	return len(events) > 0
 }
 
-// deliverEvent posts one recorded transition and records the outcome.
-func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
+// targetFor resolves where an integrator's events go. ok is false when there is
+// nothing to send to.
+func (w *Worker) targetFor(integratorID string) (target, bool) {
+	if integratorID == store.LegacyIntegratorID {
+		return target{
+			integratorID: integratorID,
+			url:          w.URL,
+			logURL:       w.URL,
+			host:         hostOf(w.URL),
+			secret:       w.Secret,
+			client:       w.HTTP,
+			legacy:       true,
+		}, true
+	}
+
+	webhookURL, sealed, err := store.LoadWebhook(w.DB, integratorID)
+	if err != nil {
+		w.Log.Error("could not load an integrator's webhook", "integrator", integratorID, "error", err)
+		w.pause(integratorID, retryBase)
+		return target{}, false
+	}
+	if webhookURL == "" {
+		if err := store.SkipOwedEvents(w.DB, integratorID, time.Now().UTC()); err != nil {
+			w.Log.Error("could not close reports with no webhook", "integrator", integratorID, "error", err)
+		}
+		return target{}, false
+	}
+
+	// Never unsigned: without its secret an integrator's delivery does not go.
+	secret, err := w.openSecret(sealed)
+	if err != nil {
+		w.Log.Error("could not open an integrator's webhook secret", "integrator", integratorID, "error", err)
+		w.pause(integratorID, retryCap)
+		return target{}, false
+	}
+	host := hostOf(webhookURL)
+	return target{
+		integratorID: integratorID,
+		url:          webhookURL,
+		logURL:       host,
+		host:         host,
+		secret:       secret,
+		client:       w.IntegratorHTTP,
+	}, true
+}
+
+func (w *Worker) openSecret(sealed string) (string, error) {
+	if w.OpenSecret == nil {
+		return "", errors.New("no way to open webhook secrets is configured")
+	}
+	secret, err := w.OpenSecret(sealed)
+	if err == nil && secret == "" {
+		return "", errors.New("the webhook secret is empty")
+	}
+	return secret, err
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
+func (w *Worker) isPaused(integratorID string, now time.Time) bool {
+	w.pausedMu.Lock()
+	defer w.pausedMu.Unlock()
+	return now.Before(w.pausedUntil[integratorID])
+}
+
+func (w *Worker) pause(integratorID string, wait time.Duration) {
+	w.pausedMu.Lock()
+	defer w.pausedMu.Unlock()
+	if w.pausedUntil == nil {
+		w.pausedUntil = make(map[string]time.Time)
+	}
+	w.pausedUntil[integratorID] = time.Now().UTC().Add(wait)
+}
+
+// cleanError makes a delivery error safe to store and show. net/http's errors
+// quote the whole URL, and a receiver's reply is whatever it chose to send: a
+// NUL byte in it would stop Postgres storing the row at all.
+func cleanError(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	message := strings.ToValidUTF8(err.Error(), "?")
+	message = strings.ReplaceAll(message, "\x00", "?")
+	if len(message) > maxErrorLength {
+		message = strings.ToValidUTF8(message[:maxErrorLength], "")
+	}
+	return message
+}
+
+// logDelivery writes one attempt to the delivery log. Best-effort, like the
+// status history: the delivery has already happened, and failing it now would
+// only send it again.
+func (w *Worker) logDelivery(ev *store.StatusEvent, dest target, code int, elapsed time.Duration, deliveryErr error) {
+	row := store.WebhookDelivery{
+		OrderID:      ev.OrderID,
+		IntegratorID: dest.integratorID,
+		Status:       ev.To,
+		Attempt:      ev.NotifyAttempts + 1,
+		URLHost:      dest.host,
+		ResponseCode: code,
+		LatencyMS:    elapsed.Milliseconds(),
+		At:           time.Now().UTC(),
+	}
+	if deliveryErr != nil {
+		row.Error = cleanError(deliveryErr)
+	}
+	if err := store.RecordWebhookDelivery(w.DB, row); err != nil {
+		w.Log.Error("could not write the delivery log", "order", ev.OrderID, "error", err)
+	}
+}
+
+// deliverEvent posts one recorded transition and records the outcome. It reports
+// whether it was delivered, and how long this event now waits if not.
+func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent, dest target) (wait time.Duration, delivered bool) {
 	status := ev.To
 
 	// The order is read for the figures — amounts, hashes — but the status
@@ -225,10 +418,9 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 	// hears the ending cannot tell a payment that worked from one that was
 	// undone.
 	var order store.Order
-	if err := w.DB.First(&order, "id = ?", ev.OrderID).Error; err != nil {
+	if err := w.DB.Omit("encrypted_seed").First(&order, "id = ?", ev.OrderID).Error; err != nil {
 		w.Log.Error("could not load order for notification", "order", ev.OrderID, "error", err)
-		w.backOff(ev)
-		return
+		return w.backOff(ev), false
 	}
 
 	refundTo := order.RefundAddress
@@ -259,12 +451,17 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		OccurredAt:        ev.At.Format(time.RFC3339),
 		Timestamp:         time.Now().UTC().Format(time.RFC3339),
 	}
+	// Which bank rail paid, and how it failed, is Linq's business. Linq-B2B shows
+	// these to its own merchants; GET /v1/orders shows neither.
+	if !dest.legacy {
+		event.PayoutProvider = ""
+		event.Reason = store.PublicReason(ev.To, ev.Reason)
+	}
 
 	body, err := json.Marshal(event)
 	if err != nil {
 		w.Log.Error("could not encode notification", "order", ev.OrderID, "error", err)
-		w.backOff(ev)
-		return
+		return w.backOff(ev), false
 	}
 
 	// Logged before the attempt, not only after it. A delivery that hangs or
@@ -275,31 +472,34 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		"order", ev.OrderID,
 		"event", event.Event,
 		"status", status,
-		"url", w.URL,
+		"integrator", dest.integratorID,
+		"url", dest.logURL,
 		"occurred_at", ev.At.Format(time.RFC3339),
 		"attempt", ev.NotifyAttempts+1,
-		"signed", w.Secret != "",
+		"signed", dest.secret != "",
 		"bytes", len(body))
 
 	start := time.Now()
-	code, err := w.post(ctx, body)
+	code, err := w.post(ctx, dest, body)
+	elapsed := time.Since(start)
+	w.logDelivery(ev, dest, code, elapsed, err)
 	if err != nil {
+		reason := cleanError(err)
 		w.Log.Warn("merchant webhook failed, will retry",
 			"order", ev.OrderID,
 			"status", status,
-			"url", w.URL,
+			"integrator", dest.integratorID,
+			"url", dest.logURL,
 			"http_status", code,
 			"attempt", ev.NotifyAttempts+1,
-			"elapsed_ms", time.Since(start).Milliseconds(),
-			"error", err)
+			"elapsed_ms", elapsed.Milliseconds(),
+			"error", reason)
 		store.RecordNotification(w.DB, ev.OrderID, status,
-			fmt.Sprintf("attempt %d failed after %dms: %v",
-				ev.NotifyAttempts+1, time.Since(start).Milliseconds(), err))
-		w.backOff(ev)
-		return
+			fmt.Sprintf("attempt %d failed after %dms: %s",
+				ev.NotifyAttempts+1, elapsed.Milliseconds(), reason))
+		return w.backOff(ev), false
 	}
 
-	elapsed := time.Since(start)
 	now := time.Now().UTC()
 	if err := w.DB.Model(&store.StatusEvent{}).
 		Where("id = ?", ev.ID).
@@ -312,7 +512,7 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		// idempotent per order and status, so the duplicate this causes on the
 		// next pass is harmless; losing the notification would not be.
 		w.Log.Error("could not record notification", "order", ev.OrderID, "error", err)
-		return
+		return 0, true
 	}
 
 	store.RecordNotification(w.DB, ev.OrderID, status,
@@ -323,12 +523,14 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 		"order", ev.OrderID,
 		"event", event.Event,
 		"status", status,
-		"url", w.URL,
+		"integrator", dest.integratorID,
+		"url", dest.logURL,
 		"http_status", code,
 		"elapsed_ms", elapsed.Milliseconds(),
 		// How long the merchant actually waited: from the thing happening to
 		// them being told. The number the whole pipeline is judged on.
 		"lag_ms", now.Sub(ev.At).Milliseconds())
+	return 0, true
 }
 
 // post sends one signed delivery, returning the receiver's status code.
@@ -337,22 +539,22 @@ func (w *Worker) deliverEvent(ctx context.Context, ev *store.StatusEvent) {
 // receiver never answered" are different problems with different fixes, and a
 // log line that flattens both into "failed" sends you looking in the wrong
 // place.
-func (w *Worker) post(ctx context.Context, body []byte) (int, error) {
+func (w *Worker) post(ctx context.Context, dest target, body []byte) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, deliveryTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dest.url, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if w.Secret != "" {
-		mac := hmac.New(sha256.New, []byte(w.Secret))
+	if dest.secret != "" {
+		mac := hmac.New(sha256.New, []byte(dest.secret))
 		mac.Write(body)
 		req.Header.Set("x-linq-signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	}
 
-	resp, err := w.HTTP.Do(req)
+	resp, err := dest.client.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -367,8 +569,8 @@ func (w *Worker) post(ctx context.Context, body []byte) (int, error) {
 	return resp.StatusCode, nil
 }
 
-// backOff records a failed attempt and schedules the next one.
-func (w *Worker) backOff(ev *store.StatusEvent) {
+// backOff records a failed attempt, schedules the next one and returns the wait.
+func (w *Worker) backOff(ev *store.StatusEvent) time.Duration {
 	attempts := ev.NotifyAttempts + 1
 
 	wait := retryBase << min(attempts-1, 16)
@@ -385,4 +587,5 @@ func (w *Worker) backOff(ev *store.StatusEvent) {
 		}).Error; err != nil {
 		w.Log.Error("could not record notification failure", "order", ev.OrderID, "error", err)
 	}
+	return wait
 }
