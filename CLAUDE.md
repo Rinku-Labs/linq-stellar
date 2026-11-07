@@ -203,7 +203,9 @@ sent. Its reference is the idempotency key Linq sees: the order ID, then
   `retrySafe: true`. A `failed` from the POST, a timeout, an error or `queued`
   means resend the same reference later (`wait`). Linq reports `failed` for
   some outcomes the bank never confirmed, such as an HTTP 5xx from the bank, so
-  `failed` alone is not proof that no money moved.
+  `failed` alone is not proof that no money moved. The Linq backend does not
+  send `retrySafe` yet, so with the switch on every real failure goes to a
+  person and only induced failures retry.
 - **An unknown outcome never refunds and never counts as an attempt.** The
   order goes back to `payout_queued` with `payout_after` 30 seconds out.
 - **With the switch on, a failure that is not retry-safe goes to `failed`** for
