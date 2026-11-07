@@ -105,14 +105,18 @@ func AddReconciliationItem(db *gorm.DB, item *ReconciliationItem) error {
 	return db.Create(item).Error
 }
 
-// SettledChecks says which checks on these orders need not run again: those
-// that have passed, and those whose mismatch a person has resolved. The ledger
-// does not change a confirmed transaction, so a check that has passed once has
-// its answer; a resolved mismatch has been looked at and explained, and
-// flagging it every fifteen minutes after that would bury anything new.
+// SettledChecks says which checks on these orders need not run again.
+//
+// A passed check has its answer: the ledger does not change a confirmed
+// transaction, and the Linq backend does not change a payout it has finished.
+// A resolved mismatch settles only the checks named in finalOnceResolved,
+// whose answer cannot change either. Any other check keeps running after a
+// resolution, so the resolution covers the answer it explained and no later
+// one (see ExplainedAlready). A resolved error settles nothing: the check was
+// never answered.
 //
 // The result maps order ID to the set of settled check names.
-func SettledChecks(db *gorm.DB, orderIDs []string) (map[string]map[string]bool, error) {
+func SettledChecks(db *gorm.DB, orderIDs, finalOnceResolved []string) (map[string]map[string]bool, error) {
 	settled := make(map[string]map[string]bool, len(orderIDs))
 	if len(orderIDs) == 0 {
 		return settled, nil
@@ -121,11 +125,14 @@ func SettledChecks(db *gorm.DB, orderIDs []string) (map[string]map[string]bool, 
 		OrderID   string
 		CheckName string
 	}
-	err := db.Model(&ReconciliationItem{}).
-		Distinct("order_id", "check_name").
-		Where("order_id IN ? AND (result = ? OR resolved_at IS NOT NULL)", orderIDs, ReconcileOK).
-		Scan(&rows).Error
-	if err != nil {
+	q := db.Model(&ReconciliationItem{}).Distinct("order_id", "check_name")
+	if len(finalOnceResolved) == 0 {
+		q = q.Where("order_id IN ? AND result = ?", orderIDs, ReconcileOK)
+	} else {
+		q = q.Where("order_id IN ? AND (result = ? OR (result = ? AND resolved_at IS NOT NULL AND check_name IN ?))",
+			orderIDs, ReconcileOK, ReconcileMismatch, finalOnceResolved)
+	}
+	if err := q.Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
@@ -137,31 +144,56 @@ func SettledChecks(db *gorm.DB, orderIDs []string) (map[string]map[string]bool, 
 	return settled, nil
 }
 
+// ExplainedAlready says whether a person has resolved this exact mismatch: the
+// same check on the same order and account, with the same answer. A check that
+// keeps running after a resolution records nothing while its answer stays the
+// one explained, and a new mismatch as soon as the answer changes.
+func ExplainedAlready(db *gorm.DB, item ReconciliationItem) (bool, error) {
+	var n int64
+	err := db.Model(&ReconciliationItem{}).
+		Where("order_id = ? AND check_name = ? AND account = ? AND result = ? AND actual = ? AND resolved_at IS NOT NULL",
+			item.OrderID, item.CheckName, item.Account, ReconcileMismatch, item.Actual).
+		Limit(1).Count(&n).Error
+	return n > 0, err
+}
+
 // ResolveReconciliationItem writes a person's explanation of a mismatch or an
 // error. A passed item has nothing to explain, and an item already resolved
 // keeps the note it was given.
+//
+// An unexplained mismatch is recorded again every cycle, so the note also goes
+// on every other unresolved copy of the same problem: the same result and
+// answer, for the same check, order and account. Copies resolved before keep
+// their own note.
 func ResolveReconciliationItem(db *gorm.DB, id int64, resolution, by string, now time.Time) (ReconciliationItem, error) {
 	at := now.UTC()
-	res := db.Model(&ReconciliationItem{}).
-		Where("id = ? AND result <> ? AND resolved_at IS NULL", id, ReconcileOK).
-		Updates(map[string]any{"resolution": resolution, "resolved_by": by, "resolved_at": &at})
-	if res.Error != nil {
-		return ReconciliationItem{}, res.Error
-	}
+	note := map[string]any{"resolution": resolution, "resolved_by": by, "resolved_at": &at}
 	var item ReconciliationItem
-	if err := db.First(&item, "id = ?", id).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ReconciliationItem{}, ErrReconcileItemNotFound
+	err := db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&ReconciliationItem{}).
+			Where("id = ? AND result <> ? AND resolved_at IS NULL", id, ReconcileOK).
+			Updates(note)
+		if res.Error != nil {
+			return res.Error
 		}
-		return ReconciliationItem{}, err
-	}
-	if res.RowsAffected == 0 {
-		if item.Result == ReconcileOK {
-			return item, ErrNothingToResolve
+		if err := tx.First(&item, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrReconcileItemNotFound
+			}
+			return err
 		}
-		return item, ErrAlreadyResolved
-	}
-	return item, nil
+		if res.RowsAffected == 0 {
+			if item.Result == ReconcileOK {
+				return ErrNothingToResolve
+			}
+			return ErrAlreadyResolved
+		}
+		return tx.Model(&ReconciliationItem{}).
+			Where("order_id = ? AND check_name = ? AND account = ? AND result = ? AND actual = ? AND resolved_at IS NULL",
+				item.OrderID, item.CheckName, item.Account, item.Result, item.Actual).
+			Updates(note).Error
+	})
+	return item, err
 }
 
 // KnownAccounts reports which of these addresses this service has a record

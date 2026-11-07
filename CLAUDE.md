@@ -226,16 +226,24 @@ engine that "fixed" a balance it had misread would move money on a bug.
   before checking anything, items as they are found, and the counts and error
   in a deferred finish, so a cycle that stops partway still says what it
   checked and why it stopped.
-- **A passed check is final, and a resolved mismatch is not flagged again.**
+- **A passed check is final; a resolution covers only the answer it explained.**
   The ledger does not change a confirmed transaction (`SettledChecks`). A
-  mismatch is checked again every cycle until someone resolves it with
-  `POST /admin/reconciliation/items/{id}/resolve`, which writes once.
+  mismatch is recorded again every cycle until someone resolves it with
+  `POST /admin/reconciliation/items/{id}/resolve`, which writes once and covers
+  every copy of that problem. A resolved transaction check is done
+  (`finalOnceResolved`). Every other check keeps running, records nothing while
+  its answer is the one explained (`ExplainedAlready`), and records a new
+  mismatch when it changes: a refunded order's payout explained as "pending"
+  that later pays must be flagged. A resolved error settles nothing.
 - **Look twice before recording a mismatch that could be the order moving.**
   A deposit seen a second before the detector claims it is not a missed
   deposit. Re-read the order and record nothing if it moved.
-- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`),
-  newest orders first. A Horizon rate-limit refusal stops the cycle's Horizon
-  checks rather than spending the rest of the budget being refused.
+- **The budget is per cycle** (`RECONCILE_HORIZON_CALLS`, `RECONCILE_PAYOUT_CALLS`).
+  Open accounts get half the Horizon budget first and the leftovers last, and
+  take turns from where the last cycle stopped (`Engine.openAfter`), so a long
+  list of them can't starve the finished orders. Finished orders go newest
+  first. A Horizon rate-limit refusal stops the cycle's Horizon checks rather
+  than spending the rest of the budget being refused.
 - **The sponsored-account check stays behind `RECONCILE_SPONSORED_ACCOUNTS`.**
   Pool accounts count as known. If another service opens accounts with the same
   sponsor, every one of them would be reported.
@@ -245,8 +253,9 @@ engine that "fixed" a balance it had misread would move money on a bug.
   be paid on a refunded order. Induced attempts never reached Linq and are not
   asked about; an order with no attempts on record is asked about by its ID.
   An order's references are asked about together or not at all in a cycle.
-  The Linq backend's `GET /internal/payout` does not send an amount yet; the
-  check compares one as soon as it does.
+  The amount is compared when the Linq backend's `GET /internal/payout` sends
+  `amountNGN` (naira), which Linq-v2 #105 adds; until then the item says
+  "amount not reported".
 - **`expected` and `actual` are read by reviewers.** Never put bank details in
   them.
 
@@ -271,3 +280,9 @@ go build ./... && go vet ./... && go test ./...
 No database, network or keys needed. `TestQuotingAndSettlingRoundTripsExactly`
 is the invariant: quote an invoice, pay exactly that quote, merchant receives
 the invoice to the kobo.
+
+The store tests also run against Postgres when `LINQ_TEST_PG_DSN` points at a
+local database (key=value form, e.g. `host=127.0.0.1 user=postgres
+password=postgres dbname=linqtest sslmode=disable`). SQLite misses migration
+races and Postgres-only constraints, so run them there before merging anything
+that touches the schema or a store query.
