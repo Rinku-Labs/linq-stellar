@@ -170,7 +170,9 @@ func TestTheRequestSchemaMatchesTheHandler(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	delete(fields, "rate") // accepted only from the legacy caller
+	// Accepted only from the legacy caller.
+	delete(fields, "rate")
+	delete(fields, "manualDeposit")
 
 	documented := loadSpec(t).Components.Schemas["CreateOrderRequest"].Properties
 	for field := range fields {
@@ -182,6 +184,35 @@ func TestTheRequestSchemaMatchesTheHandler(t *testing.T) {
 		if _, ok := fields[field]; !ok {
 			t.Errorf("%s is documented but not read", field)
 		}
+	}
+}
+
+// Every claim in the docs has to be true today, so the test deployment is not
+// described as if it exists. Remove this when SD-7 is live.
+func TestTestModeIsMarkedComingSoon(t *testing.T) {
+	_, section, found := strings.Cut(string(docs.Guide), "## Test mode")
+	if !found || !strings.Contains(section, "Coming soon") {
+		t.Error("the guide presents test mode as available")
+	}
+}
+
+// The status table must match what a caller really gets. A revoked or expired
+// key is refused by authentication, before rotation can answer 409.
+func TestTheDocumentedRotationErrorsAreReal(t *testing.T) {
+	p := newPublicAPI(t)
+	id, key := p.issue(t, p.integrator(t, "A"))
+	if w := p.asKey(key, http.MethodPost, "/v1/keys/rotate", ""); w.Code != http.StatusCreated {
+		t.Fatalf("rotate: %d", w.Code)
+	}
+	if w := p.asKey(key, http.MethodPost, "/v1/keys/rotate", ""); w.Code != http.StatusConflict {
+		t.Errorf("already rotated: %d, want 409", w.Code)
+	}
+	p.asAdmin(http.MethodPost, "/admin/keys/"+id+"/revoke", "")
+	if w := p.asKey(key, http.MethodPost, "/v1/keys/rotate", ""); w.Code != http.StatusUnauthorized {
+		t.Errorf("revoked: %d, want 401", w.Code)
+	}
+	if !strings.Contains(string(docs.Guide), "| `409` | This key was already rotated |") {
+		t.Error("the error table does not say what 409 means")
 	}
 }
 

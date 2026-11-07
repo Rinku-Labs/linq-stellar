@@ -7,7 +7,7 @@ info:
     Guides are at /docs.
 servers:
   - url: /
-    description: The host serving this file. Live and test mode are separate hosts.
+    description: The host serving this file.
 security:
   - apiKey: []
 tags:
@@ -117,7 +117,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409':
-          description: This key is revoked, expired or already rotated.
+          description: This key was already rotated.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -220,10 +220,6 @@ components:
         refundAddress:
           type: string
           description: Stellar account for a refund. Must be able to receive USDC. Defaults to the account that paid.
-        manualDeposit:
-          type: boolean
-          default: false
-          description: Pay for what arrives when a deposit exceeds the quote, instead of paying the quote.
     Order:
       type: object
       required:
@@ -254,7 +250,7 @@ components:
         feeUsdc: { type: number }
         currency: { type: string }
         assetCode: { type: string, example: USDC }
-        assetIssuer: { type: string, description: Issuer of the asset to pay with. Differs in test mode. }
+        assetIssuer: { type: string, description: Issuer of the asset to pay with. }
         depositDeadline: { type: string, format: date-time }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
