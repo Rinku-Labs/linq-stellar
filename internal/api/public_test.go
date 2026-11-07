@@ -227,8 +227,11 @@ func TestRotationKeepsTheOldKeyForTheOverlap(t *testing.T) {
 		t.Errorf("new key after the overlap: %d, want 404 (authenticated)", got)
 	}
 
+	if _, err := store.RecordExpiredKeys(p.db, p.clock); err != nil {
+		t.Fatalf("worker pass: %v", err)
+	}
 	wantActions(t, p.actions(t, oldID),
-		store.CredentialIssued, store.CredentialRotated, store.CredentialExpired, store.CredentialRejectedExpired)
+		store.CredentialIssued, store.CredentialRotated, store.CredentialRejectedExpired, store.CredentialExpired)
 	wantActions(t, p.actions(t, newID), store.CredentialIssued)
 }
 
@@ -289,8 +292,7 @@ func TestRevocationIsImmediateAndRejectionsAreRecorded(t *testing.T) {
 		t.Errorf("rotating with a revoked key: %d, want 401", w.Code)
 	}
 	wantActions(t, p.actions(t, id),
-		store.CredentialIssued, store.CredentialRevoked,
-		store.CredentialRejectedRevoked, store.CredentialRejectedRevoked)
+		store.CredentialIssued, store.CredentialRevoked, store.CredentialRejectedRevoked)
 }
 
 // Guessing wrong proves nothing about the key named, so it must not appear in

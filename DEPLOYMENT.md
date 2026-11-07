@@ -102,6 +102,13 @@ The URL must be https and public. An integrator with no webhook polls instead:
 its events are closed unreported, and setting a URL later does not replay them.
 Linq-B2B's webhook stays in `MERCHANT_WEBHOOK_URL` and can't be set here. Every
 attempt, for every integrator, is a row in `webhook_deliveries`.
+Revoking a key also revokes every key it was rotated to, because whoever holds a
+leaked key can rotate it. The reply lists them in `alsoRevoked`, and the owner
+then needs a newly issued key. `linq-b2b` can't hold issued keys.
+
+**Don't turn `PUBLIC_API_ENABLED` on before SD-3 is deployed.** Until then every
+integrator's order events go to `MERCHANT_WEBHOOK_URL`, and `/v1` shows raw
+failure reasons.
 
 Missing variables are all reported at once on the first boot, not one per
 restart.
