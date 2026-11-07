@@ -20,6 +20,10 @@ type Config struct {
 	Port        string
 	LogLevel    string
 	DatabaseURL string
+	// DBMaxOpenConns caps the server's connections to Postgres, so a burst of
+	// requests queues for a connection instead of exhausting the database for
+	// every other service on it. The cap is per instance. The worker is not capped.
+	DBMaxOpenConns int
 
 	HorizonURL        string
 	NetworkPassphrase string
@@ -48,6 +52,14 @@ type Config struct {
 	// because the worker binary shares this struct and never serves HTTP; the
 	// server binary is the one that requires it before it will listen.
 	OrdersAPIKey string
+
+	// PublicAPIEnabled serves /v1 and /admin. Off unless set to "true": orders
+	// taken there move money, and turning it off must not touch the legacy
+	// routes.
+	PublicAPIEnabled bool
+	// AdminAPIKey guards /admin, sent as X-Admin-Key. Empty refuses every admin
+	// request; the server still starts, so the legacy routes never depend on it.
+	AdminAPIKey string
 
 	HomeDomain       string
 	WebAuthDomain    string
@@ -79,6 +91,7 @@ func Load() (Config, error) {
 		Port:              env("PORT", "8080"),
 		LogLevel:          env("LOG_LEVEL", "info"),
 		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		DBMaxOpenConns:    int(integer("DB_MAX_OPEN_CONNS", 20)),
 		HorizonURL:        os.Getenv("STELLAR_HORIZON_URL"),
 		NetworkPassphrase: os.Getenv("STELLAR_NETWORK_PASSPHRASE"),
 		USDCIssuer:        os.Getenv("STELLAR_USDC_ISSUER"),
@@ -88,8 +101,10 @@ func Load() (Config, error) {
 		LinqAPIURL:        os.Getenv("LINQ_API_URL"),
 		LinqAPISecret:     os.Getenv("LINQ_INTERNAL_SECRET"),
 		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
+		PublicAPIEnabled:  os.Getenv("PUBLIC_API_ENABLED") == "true",
+		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
 
-		MerchantWebhookURL:    os.Getenv("MERCHANT_WEBHOOK_URL"),
+		MerchantWebhookURL:   os.Getenv("MERCHANT_WEBHOOK_URL"),
 		MerchantWebhookSecret: os.Getenv("MERCHANT_WEBHOOK_SECRET"),
 
 		HomeDomain:        os.Getenv("SEP10_HOME_DOMAIN"),

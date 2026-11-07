@@ -4,16 +4,80 @@ import "gorm.io/gorm"
 
 // Migrate creates or updates the schema this service owns.
 //
-// Four tables: the settlement orders themselves, the transitions each one
-// made, the Horizon stream cursors that make reconnects safe, and the pool of
-// deposit accounts provisioned ahead of the orders that will use them. Nothing
-// else — this service does not own merchant records or bank details beyond what
-// it needs to settle one payment.
+// The settlement orders themselves, the transitions each one made, the Horizon
+// stream cursors that make reconnects safe, the pool of deposit accounts
+// provisioned ahead of the orders that will use them, and the integrators, keys
+// and rate counters behind the public API. Nothing else — this service does not
+// own merchant records or bank details beyond what it needs to settle one
+// payment.
+//
+// Server and worker both migrate at startup, and two CREATE TABLEs for the same
+// table collide in Postgres's catalog even with IF NOT EXISTS. So the whole of it
+// runs in one transaction behind an advisory lock: the second instance waits, then
+// finds nothing left to do. DDL is transactional in Postgres, so a failure leaves
+// no half-applied schema either. A statement that cannot run in a transaction,
+// such as CREATE INDEX CONCURRENTLY, does not belong in here.
 func Migrate(db *gorm.DB) error {
-	if err := db.AutoMigrate(&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{}); err != nil {
+	if db.Dialector.Name() != "postgres" {
+		return migrate(db)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLock).Error; err != nil {
+			return err
+		}
+		return migrate(tx)
+	})
+}
+
+// migrationLock is an arbitrary number shared by everything that migrates.
+const migrationLock = 7283945
+
+func migrate(db *gorm.DB) error {
+	if err := db.AutoMigrate(
+		&Order{}, &StatusEvent{}, &StreamCursor{}, &PoolAccount{},
+		&Integrator{}, &APIKey{}, &CredentialEvent{}, &RateCounter{},
+	); err != nil {
+		return err
+	}
+	if err := seedLegacyIntegrator(db); err != nil {
+		return err
+	}
+	// Idempotency is per integrator now. The composite index is already in
+	// place by this point, so the orders table is never without a guard. Rows
+	// cannot collide on it: the old index had them unique on the key alone.
+	if err := db.Exec(`DROP INDEX IF EXISTS idx_stellar_orders_idempotency_key`).Error; err != nil {
+		return err
+	}
+	if err := protectCredentialEvents(db); err != nil {
 		return err
 	}
 	return createWorkerIndexes(db)
+}
+
+// protectCredentialEvents makes the rotation and revocation proof append-only:
+// a row anyone could quietly edit would prove nothing. Postgres only; the tests'
+// SQLite has no such trigger.
+func protectCredentialEvents(db *gorm.DB) error {
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+	return db.Exec(`
+		DO $migrate$
+		BEGIN
+			CREATE OR REPLACE FUNCTION credential_events_append_only() RETURNS trigger AS $fn$
+			BEGIN
+				RAISE EXCEPTION 'credential_events is append-only';
+			END
+			$fn$ LANGUAGE plpgsql;
+			IF NOT EXISTS (SELECT 1 FROM pg_trigger
+			                WHERE tgname = 'credential_events_append_only'
+			                  AND tgrelid = 'credential_events'::regclass) THEN
+				CREATE TRIGGER credential_events_append_only
+					BEFORE UPDATE OR DELETE ON credential_events
+					FOR EACH ROW EXECUTE FUNCTION credential_events_append_only();
+			END IF;
+		END
+		$migrate$`).Error
 }
 
 // createWorkerIndexes adds one composite index per worker query.
@@ -53,6 +117,21 @@ func createWorkerIndexes(db *gorm.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_pool_ready
 		   ON stellar_deposit_pool (id)
 		   WHERE claimed_at IS NULL AND ready = true`,
+
+		// One rejection row per key, action and minute. See RecordRejection.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_events_rejected
+		   ON credential_events (key_id, action, rejected_minute)
+		   WHERE rejected_minute IS NOT NULL`,
+
+		// One `expired` row per key, however many callers notice it.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_events_expired
+		   ON credential_events (key_id)
+		   WHERE action = 'expired'`,
+
+		// Pruning: counters are keyed by key first, so the delete by age needs
+		// its own path.
+		`CREATE INDEX IF NOT EXISTS idx_rate_counters_window
+		   ON api_rate_counters (window_start)`,
 	}
 	for _, statement := range statements {
 		if err := db.Exec(statement).Error; err != nil {

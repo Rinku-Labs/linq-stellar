@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/Rinku-Labs/linq-stellar/internal/config"
 	"github.com/Rinku-Labs/linq-stellar/internal/notify"
@@ -23,6 +24,7 @@ import (
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
 	"github.com/Rinku-Labs/linq-stellar/internal/wake"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -92,7 +94,7 @@ func run() error {
 		Log:     log.With("component", "settle"),
 	}
 
-	// Six loops, run together. The streamer detects deposits in about a
+	// Seven loops, run together. The streamer detects deposits in about a
 	// second; the scanner is the backstop that catches whatever the streamer
 	// dropped across a reconnect. Both enter settlement through the same claim.
 	// The notifier is what tells the Linq backend any of it happened.
@@ -131,6 +133,14 @@ func run() error {
 			DB: db, Chain: chain, Log: log.With("component", "pool"),
 			Size: cfg.AccountPoolSize, Bus: bus,
 		}).Run,
+		// Seventh: credential housekeeping, which touches no order. Nothing
+		// signals it; there is nothing here anyone is waiting for.
+		wake.Loop{
+			Name:     "housekeeping",
+			Interval: housekeepingInterval,
+			Log:      log.With("component", "housekeeping"),
+			Work:     housekeeping(db, log.With("component", "housekeeping")),
+		}.Run,
 	}
 
 	log.Info("worker starting",
@@ -157,6 +167,32 @@ func run() error {
 	log.Info("shutting down; waiting for workers to finish their current pass")
 	wg.Wait()
 	return nil
+}
+
+// housekeepingInterval is how often counters are pruned and key expiries are
+// written down. Neither is urgent: a counter is only read in its own minute, and
+// an expired key is refused whether or not its event exists yet.
+const housekeepingInterval = 5 * time.Minute
+
+// housekeeping is one pass of the credential upkeep: write the `expired` event
+// for keys that have lapsed, and delete rate counters past their hour.
+func housekeeping(db *gorm.DB, log *slog.Logger) func(context.Context) bool {
+	return func(context.Context) bool {
+		now := time.Now().UTC()
+		expired, err := store.RecordExpiredKeys(db, now)
+		if err != nil {
+			log.Error("could not record expired keys", "error", err)
+		}
+		pruned, err := store.PruneRateCounters(db, now)
+		if err != nil {
+			log.Error("could not prune rate counters", "error", err)
+		}
+		if expired > 0 || pruned > 0 {
+			log.Info("housekeeping pass", "keysExpired", expired, "countersPruned", pruned)
+		}
+		// Always "worked": this loop keeps its interval rather than backing off.
+		return true
+	}
 }
 
 // waker turns "an order moved" into "wake whoever owns what comes next".

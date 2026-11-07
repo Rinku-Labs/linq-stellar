@@ -44,7 +44,7 @@ func run() error {
 	}
 	log := newLogger(cfg.LogLevel)
 
-	db, err := openDB(cfg.DatabaseURL)
+	db, err := openDB(cfg.DatabaseURL, cfg.DBMaxOpenConns)
 	if err != nil {
 		return err
 	}
@@ -69,7 +69,7 @@ func run() error {
 	// backend — everything from the consumer app. Without it only this
 	// service's own orders qualify, and consumer payers keep paying their own
 	// network fee.
-	depositLookup, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
+	linq, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
 	if err != nil {
 		return err
 	}
@@ -83,13 +83,18 @@ func run() error {
 	srv := &api.Server{
 		DB:            db,
 		Chain:         chain,
-		DepositLookup: depositLookup,
+		DepositLookup: linq,
+		Rates:         &payout.CachedRate{Fetch: linq.OfframpRate, MaxAge: payout.RateMaxAge},
 		HomeDomain:    cfg.HomeDomain,
 		DepositWindow: cfg.DepositWindow,
 		OrdersAPIKey:  cfg.OrdersAPIKey,
 		Log:           log.With("component", "api"),
 		Wake:          bus,
+
+		PublicAPIEnabled: cfg.PublicAPIEnabled,
+		AdminAPIKey:      cfg.AdminAPIKey,
 	}
+	log.Info("public api", "enabled", cfg.PublicAPIEnabled, "adminKeySet", cfg.AdminAPIKey != "")
 
 	// SEP-7 signing is optional. Without a key the URIs are still valid; wallets
 	// that check simply show them as unverified.
@@ -130,6 +135,11 @@ func run() error {
 		Addr:              ":" + cfg.Port,
 		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bounds a client trickling a body or holding a connection open. There is
+		// deliberately no WriteTimeout: it would cut the response to a request that
+		// has already submitted a transaction, and the caller would retry it.
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 120 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
