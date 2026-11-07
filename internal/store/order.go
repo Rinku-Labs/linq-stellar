@@ -130,6 +130,14 @@ type Order struct {
 	// pass, forever, and the set only grows.
 	ReservesReclaimed bool `gorm:"default:false;index" json:"reservesReclaimed"`
 
+	// InducedFailure is empty, or InducedTransient or InducedTerminal for a
+	// Linq test order whose payout fails on purpose. See InducePayoutFailure.
+	InducedFailure string `gorm:"not null;default:''" json:"-"`
+	// PayoutAfter holds off the payout worker after an attempt whose outcome
+	// could not be learned, so a provider outage is asked about every so often
+	// rather than on every pass. Nil means now.
+	PayoutAfter *time.Time `gorm:"index" json:"-"`
+
 	PayoutAttempts int  `gorm:"default:0" json:"payoutAttempts"`
 	SweepAttempts  int  `gorm:"default:0" json:"sweepAttempts"`
 	RefundAttempts int  `gorm:"default:0" json:"refundAttempts"`

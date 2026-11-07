@@ -114,6 +114,7 @@ func run() error {
 		}).Run,
 		(&payout.Worker{
 			DB: db, Provider: provider, Log: log.With("component", "payout"), Bus: bus,
+			NewReferenceOnRetry: cfg.PayoutNewReferenceOnRetry,
 		}).Run,
 		(&settle.ChainWorker{
 			DB: db, Chain: chain, Treasury: cfg.TreasuryWallet,

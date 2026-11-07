@@ -64,6 +64,7 @@ variable; setting it there is harmless but does nothing.
 | Variable | Default | What it is |
 |---|---|---|
 | `PUBLIC_API_ENABLED` | off | Serves `/v1` and `/admin` when exactly `true`. Orders taken on `/v1` move money, so this is the off switch: unset it and redeploy, and those routes stop existing whatever keys were issued. The legacy `/orders` routes do not depend on it |
+| (no variable) | | With the switch on, the integrator guide is served at `/docs` and the spec at `/docs/openapi.yaml`, unauthenticated. Sources are in `docs/api/`, embedded in the binary |
 | `ADMIN_API_KEY` | empty | Sent as `X-Admin-Key` to `/admin`. Empty refuses every admin request. Generate: `openssl rand -hex 32` |
 | `DB_MAX_OPEN_CONNS` | `20` | Connections the server may hold to Postgres, per instance. Keep instances x this below the database's `max_connections`, leaving room for the worker |
 
@@ -171,6 +172,7 @@ key and nothing can sweep or reclaim them afterwards.
 | `STELLAR_MAX_STREAMS` | `200` | Concurrent Horizon streams; past this, orders fall back to polling |
 | `STELLAR_ACCOUNT_POOL` | `10` | Deposit accounts kept provisioned ahead of demand, so `POST /orders` costs a database round-trip instead of a ledger close. `0` disables it and returns to provisioning inline. Each waiting account holds ~1 XLM of sponsor reserves, returned when the account is merged back after settlement |
 | `STELLAR_BASE_FEE` | `10000` stroops | Headroom for network congestion |
+| `PAYOUT_NEW_REFERENCE_ON_RETRY` | off | `worker` only. When exactly `true`, a payout retry after a failure the Linq backend confirms as retry-safe (`retrySafe: true` on `GET /internal/payout`) uses a new reference (`<order>-p2`, `-p3`), so the retry really pays. A failure without that confirmation stops the order in `failed` for a person to check, instead of retrying or refunding. Off, every retry reuses the order ID and reads back the first failure, then refunds after three, as before |
 
 ### SEP-10 (optional, all three or none)
 
