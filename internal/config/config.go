@@ -83,6 +83,17 @@ type Config struct {
 	OrgURL         string
 	OrgDescription string
 	OrgEmail       string
+
+	// Reconciliation, run by the worker. ReconcileInterval is how often a cycle
+	// runs. The two call budgets bound one cycle's requests to Horizon and to
+	// the payout provider; what a cycle cannot reach waits for the next one.
+	// ReconcileSponsoredAccounts turns on the search for sponsored accounts
+	// with no order behind them, which stays off until the sponsor is known not
+	// to be shared with another service.
+	ReconcileInterval          time.Duration
+	ReconcileHorizonCalls      int
+	ReconcilePayoutCalls       int
+	ReconcileSponsoredAccounts bool
 }
 
 // Load reads configuration from the environment.
@@ -127,6 +138,11 @@ func Load() (Config, error) {
 		BaseFee:           integer("STELLAR_BASE_FEE", 0),
 		MaxStreams:        int(integer("STELLAR_MAX_STREAMS", 200)),
 		AccountPoolSize:   int(integer("STELLAR_ACCOUNT_POOL", 10)),
+
+		ReconcileInterval:          duration("RECONCILE_INTERVAL", 15*time.Minute),
+		ReconcileHorizonCalls:      int(integer("RECONCILE_HORIZON_CALLS", 200)),
+		ReconcilePayoutCalls:       int(integer("RECONCILE_PAYOUT_CALLS", 50)),
+		ReconcileSponsoredAccounts: os.Getenv("RECONCILE_SPONSORED_ACCOUNTS") == "true",
 	}
 
 	var problems []string
@@ -150,6 +166,14 @@ func Load() (Config, error) {
 	}
 	if c.LinqAPISecret == "" {
 		problems = append(problems, "LINQ_INTERNAL_SECRET is required")
+	}
+	// A cycle reads hundreds of things from Horizon. Run back to back, it would
+	// spend the rate limit the settlement loops depend on.
+	if c.ReconcileInterval < time.Minute {
+		problems = append(problems, "RECONCILE_INTERVAL must be at least 1m")
+	}
+	if c.ReconcileHorizonCalls < 0 || c.ReconcilePayoutCalls < 0 {
+		problems = append(problems, "RECONCILE_HORIZON_CALLS and RECONCILE_PAYOUT_CALLS cannot be negative")
 	}
 
 	if len(problems) > 0 {

@@ -74,6 +74,9 @@ type Result struct {
 	Provider string
 	// FailureReason is set when Status is StatusFailed.
 	FailureReason string
+	// AmountNGN is what the provider says it paid, when it says. Nil means it
+	// did not report an amount, which is not the same as zero.
+	AmountNGN *float64
 	// RetrySafe is set with StatusFailed when the provider confirms no money
 	// moved, so a payout under a new reference cannot pay twice. A failure
 	// without it may still have reached the bank.

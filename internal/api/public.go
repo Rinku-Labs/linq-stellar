@@ -84,6 +84,7 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/keys/{id}/rotate", s.requireAdminKey(s.handleAdminRotateKey))
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.requireAdminKey(s.handleRevokeKey))
 	mux.HandleFunc("GET /admin/credential-events", s.requireAdminKey(s.handleCredentialEvents))
+	mux.HandleFunc("POST /admin/reconciliation/items/{id}/resolve", s.requireAdminKey(s.handleResolveReconciliationItem))
 	mux.HandleFunc("POST /admin/orders/{id}/induce-payout-failure", s.requireAdminKey(s.handleInducePayoutFailure))
 }
 

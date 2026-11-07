@@ -59,6 +59,7 @@ holds funds only between deposit and sweep.
 | `internal/settle` | Deposit detection, claiming, refunds |
 | `internal/payout` | NGN disbursement via the Linq B2B API |
 | `internal/store` | Order schema, lifecycle states, CAS guards |
+| `internal/reconcile` | Checking the books against the ledger every 15 minutes, read-only |
 | `internal/sep` | SEP-1, SEP-7, SEP-10 |
 
 ## Running

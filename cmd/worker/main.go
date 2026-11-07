@@ -20,6 +20,7 @@ import (
 	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/payout"
 	"github.com/Rinku-Labs/linq-stellar/internal/pool"
+	"github.com/Rinku-Labs/linq-stellar/internal/reconcile"
 	"github.com/Rinku-Labs/linq-stellar/internal/settle"
 	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
@@ -94,7 +95,7 @@ func run() error {
 		Log:     log.With("component", "settle"),
 	}
 
-	// Seven loops, run together. The streamer detects deposits in about a
+	// Eight loops, run together. The streamer detects deposits in about a
 	// second; the scanner is the backstop that catches whatever the streamer
 	// dropped across a reconnect. Both enter settlement through the same claim.
 	// The notifier is what tells the Linq backend any of it happened.
@@ -144,6 +145,10 @@ func run() error {
 			Log:      log.With("component", "housekeeping"),
 			Work:     housekeeping(db, log.With("component", "housekeeping")),
 		}.Run,
+		// Eighth: reconciliation. It reads the ledger and the payout provider
+		// and writes down what it finds; it moves no money and changes no
+		// order. It runs once at boot, then on its own interval.
+		reconciliation(db, chain, provider, cfg, log.With("component", "reconcile")),
 	}
 
 	log.Info("worker starting",
@@ -202,6 +207,37 @@ func housekeeping(db *gorm.DB, log *slog.Logger) func(context.Context) bool {
 		// Always "worked": this loop keeps its interval rather than backing off.
 		return true
 	}
+}
+
+// reconciliation is the reconciliation loop. Its interval is fixed rather
+// than widening while quiet, because the record of cycles running on schedule
+// is part of what it is for.
+func reconciliation(db *gorm.DB, chain *stellar.Client, payouts reconcile.Payouts,
+	cfg config.Config, log *slog.Logger) func(context.Context) {
+	engine := &reconcile.Engine{
+		DB:             db,
+		Ledger:         chain,
+		Payouts:        payouts,
+		Treasury:       cfg.TreasuryWallet,
+		HorizonCalls:   cfg.ReconcileHorizonCalls,
+		PayoutCalls:    cfg.ReconcilePayoutCalls,
+		CheckSponsored: cfg.ReconcileSponsoredAccounts,
+		Log:            log,
+	}
+	return wake.Loop{
+		Name:     "reconcile",
+		Interval: cfg.ReconcileInterval,
+		Log:      log,
+		Fields: []any{"horizonCalls", cfg.ReconcileHorizonCalls, "payoutCalls", cfg.ReconcilePayoutCalls,
+			"sponsoredAccounts", cfg.ReconcileSponsoredAccounts},
+		Work: func(ctx context.Context) bool {
+			if _, err := engine.RunCycle(ctx); err != nil {
+				log.Error("could not run a reconciliation cycle", "error", err)
+			}
+			// Always "worked": the loop keeps its interval.
+			return true
+		},
+	}.Run
 }
 
 // waker turns "an order moved" into "wake whoever owns what comes next".

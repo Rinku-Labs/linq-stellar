@@ -108,6 +108,49 @@ Revoking a key also revokes every key it was rotated to, because whoever holds a
 leaked key can rotate it. The reply lists them in `alsoRevoked`, and the owner
 then needs a newly issued key. `linq-b2b` can't hold issued keys.
 
+### Reconciliation (`worker` only, all optional)
+
+The worker checks the books against the ledger every 15 minutes, starting at
+boot, and records each cycle in `reconciliation_cycles` and each check in
+`reconciliation_items`. It only reads: a mismatch is written down, never acted
+on. A cycle logs `reconciliation cycle finished` with its counts, and each
+mismatch as `reconciliation mismatch`.
+
+| Variable | Default | What it is |
+|---|---|---|
+| `RECONCILE_INTERVAL` | `15m` | Time between cycles, at least `1m` |
+| `RECONCILE_HORIZON_CALLS` | `200` | Horizon requests one cycle may make. Open deposit accounts get half of it first, taking turns across cycles when there are more than that, and whatever is left at the end. Finished orders get the rest, newest first. What a cycle cannot reach waits for the next one. Four cycles an hour at 200 is 800 requests, well inside Horizon's 3,600 an hour |
+| `RECONCILE_PAYOUT_CALLS` | `50` | `GET /internal/payout` requests one cycle may make to the Linq backend. An order is asked about under each payout reference it used, so a payout retried under new references costs one request per reference |
+| `RECONCILE_SPONSORED_ACCOUNTS` | off | Exactly `true` turns on the check for accounts the sponsor pays reserves for with no order or pool row behind them. **Leave it off on mainnet until you know no other service uses the same sponsor account** (Linq-v2 has a `STELLAR_SPONSOR_KEY` too): every account another service opens would be reported |
+
+To record why a mismatch is not a problem, or what was done about it:
+
+```bash
+curl -X POST $HOST/admin/reconciliation/items/$ITEM_ID/resolve -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -d '{"resolution":"Induced failure for the SD-11 demo","resolvedBy":"ify"}'
+```
+
+**This route only exists with `PUBLIC_API_ENABLED=true` on the server**, like
+every `/admin` route. That is deliberate: the switch turns off everything an
+admin key can do. With it off, mismatches are still recorded and shown on
+`/reconciliation`; they just can't be resolved until it is on.
+
+What a resolution does:
+
+- **It covers every copy of that problem.** An unexplained mismatch is recorded
+  again every cycle, and the note goes on all of its copies.
+- **A transaction check is then done.** Its answer can't change.
+- **Any other check keeps running**, because its answer can: a payout that was
+  "still in progress" can pay later. It records nothing while the answer is the
+  one explained, and a new mismatch, needing its own note, if the answer
+  changes.
+- **Resolving an error ("could not check") does not stop it being checked.** It
+  was never answered.
+- **A resolution cannot be rewritten.**
+
+With more than one worker instance, each runs its own cycles. That is safe,
+since the cycles only read, but it records each check twice.
+
 Missing variables are all reported at once on the first boot, not one per
 restart.
 
