@@ -495,7 +495,7 @@ func (s *Server) handleOrderStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
-	if callerOf(r).keyID == "" { // the legacy shared key
+	if callerOf(r).legacy() {
 		s.writeOrder(w, r, http.StatusOK, &order)
 		return
 	}
