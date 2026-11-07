@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -243,9 +244,85 @@ func ResolvedAccounts(db *gorm.DB, check string, accounts []string) (map[string]
 
 // LatestCycles returns the most recent cycles, newest first.
 func LatestCycles(db *gorm.DB, limit int) ([]ReconciliationCycle, error) {
+	return ListCycles(db, 0, limit)
+}
+
+// ListCycles returns up to limit cycles older than before, newest first. A
+// before of zero starts from the newest.
+func ListCycles(db *gorm.DB, before int64, limit int) ([]ReconciliationCycle, error) {
+	q := db.Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit)
+	if before > 0 {
+		q = q.Where("id < ?", before)
+	}
 	var cycles []ReconciliationCycle
-	err := db.Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit).Find(&cycles).Error
+	err := q.Find(&cycles).Error
 	return cycles, err
+}
+
+// ErrCycleNotFound means there is no reconciliation cycle with that ID.
+var ErrCycleNotFound = errors.New("store: reconciliation cycle not found")
+
+// GetCycle returns one cycle.
+func GetCycle(db *gorm.DB, id int64) (ReconciliationCycle, error) {
+	var cycle ReconciliationCycle
+	err := db.First(&cycle, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return cycle, ErrCycleNotFound
+	}
+	return cycle, err
+}
+
+// CycleItems returns a cycle's items in the order they were checked, or only
+// its mismatches.
+func CycleItems(db *gorm.DB, cycleID int64, mismatchesOnly bool) ([]ReconciliationItem, error) {
+	q := db.Where("cycle_id = ?", cycleID)
+	if mismatchesOnly {
+		q = q.Where("result = ?", ReconcileMismatch)
+	}
+	var items []ReconciliationItem
+	err := q.Order("id").Find(&items).Error
+	return items, err
+}
+
+// problemKey is what makes mismatch items the same problem: the same answer to
+// the same check on the same order and account. An unexplained problem is
+// recorded again every cycle, and a resolution goes on every copy (see
+// ResolveReconciliationItem), so pages count and list problems, not copies.
+var problemKey = []string{"order_id", "account", "check_name", "actual"}
+
+// ListMismatches returns up to limit problems older than before, newest first:
+// each once, as most recently recorded, which carries its resolution when it
+// has one. A before of zero starts from the newest.
+func ListMismatches(db *gorm.DB, before int64, limit int) ([]ReconciliationItem, error) {
+	latest := db.Model(&ReconciliationItem{}).Select("MAX(id)").
+		Where("result = ?", ReconcileMismatch).Group(strings.Join(problemKey, ", "))
+	q := db.Where("id IN (?)", latest).
+		Order(clause.OrderByColumn{Column: clause.Column{Name: "id"}, Desc: true}).Limit(limit)
+	if before > 0 {
+		q = q.Where("id < ?", before)
+	}
+	var items []ReconciliationItem
+	err := q.Find(&items).Error
+	return items, err
+}
+
+// MismatchCounts counts problems, not copies: every problem ever found, and
+// those with no resolution on any copy.
+func MismatchCounts(db *gorm.DB) (total, unresolved int64, err error) {
+	problems := func(unresolvedOnly bool) *gorm.DB {
+		q := db.Model(&ReconciliationItem{}).Distinct(problemKey).Where("result = ?", ReconcileMismatch)
+		if unresolvedOnly {
+			q = q.Where(`NOT EXISTS (SELECT 1 FROM reconciliation_items r WHERE r.result = ? AND r.resolved_at IS NOT NULL
+				AND r.order_id = reconciliation_items.order_id AND r.account = reconciliation_items.account
+				AND r.check_name = reconciliation_items.check_name AND r.actual = reconciliation_items.actual)`, ReconcileMismatch)
+		}
+		return q
+	}
+	if err = db.Table("(?) AS problems", problems(false)).Count(&total).Error; err != nil {
+		return 0, 0, err
+	}
+	err = db.Table("(?) AS problems", problems(true)).Count(&unresolved).Error
+	return total, unresolved, err
 }
 
 // CompletedCycles counts the cycles that ran to the end.

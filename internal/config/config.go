@@ -64,6 +64,9 @@ type Config struct {
 	// AdminAPIKey guards /admin, sent as X-Admin-Key. Empty refuses every admin
 	// request; the server still starts, so the legacy routes never depend on it.
 	AdminAPIKey string
+	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// page does not exist.
+	ReviewerToken string
 
 	HomeDomain       string
 	WebAuthDomain    string
@@ -95,6 +98,9 @@ type Config struct {
 	ReconcilePayoutCalls       int
 	ReconcileSponsoredAccounts bool
 }
+
+// minReviewerTokenLen is the shortest REVIEWER_TOKEN accepted.
+const minReviewerTokenLen = 32
 
 // Load reads configuration from the environment.
 //
@@ -143,6 +149,7 @@ func Load() (Config, error) {
 		ReconcileHorizonCalls:      int(integer("RECONCILE_HORIZON_CALLS", 200)),
 		ReconcilePayoutCalls:       int(integer("RECONCILE_PAYOUT_CALLS", 50)),
 		ReconcileSponsoredAccounts: os.Getenv("RECONCILE_SPONSORED_ACCOUNTS") == "true",
+		ReviewerToken:              os.Getenv("REVIEWER_TOKEN"),
 	}
 
 	var problems []string
@@ -174,6 +181,11 @@ func Load() (Config, error) {
 	}
 	if c.ReconcileHorizonCalls < 0 || c.ReconcilePayoutCalls < 0 {
 		problems = append(problems, "RECONCILE_HORIZON_CALLS and RECONCILE_PAYOUT_CALLS cannot be negative")
+	}
+	// The token is the page's only lock, and it is given to people outside the
+	// team. A short one could be guessed.
+	if c.ReviewerToken != "" && len(c.ReviewerToken) < minReviewerTokenLen {
+		problems = append(problems, fmt.Sprintf("REVIEWER_TOKEN must be at least %d characters; generate one with: openssl rand -hex 32", minReviewerTokenLen))
 	}
 
 	if len(problems) > 0 {

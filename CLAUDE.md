@@ -261,6 +261,31 @@ engine that "fixed" a balance it had misread would move money on a bug.
 - **`expected` and `actual` are read by reviewers.** Never put bank details in
   them.
 
+## The reconciliation page is for people outside Linq
+
+`/reconciliation` (`internal/api/reconciliation_page.go`) shows a reviewer the
+cycles and items, and is opened with `REVIEWER_TOKEN` alone. It is only served
+when that is set.
+
+- **It reads the reconciliation tables and nothing else.** That is why it can
+  promise no bank detail: the items were written without any. Do not join it to
+  `orders` to show more; a merchant's account number is one join away.
+- **The cookie holds an HMAC of a fixed label under the token, never the
+  token.** It proves the browser was given the token, and stops working when the
+  token changes. Compare with `sameSecret`, which hashes both sides before a
+  constant-time compare so a length leaks nothing either.
+- **The token opens this page only.** Not `/admin`, not `/v1`. Keep it a
+  separate secret from `ADMIN_API_KEY`: a reviewer is given it.
+- **`html/template`, never `text/template`.** `expected`, `actual` and a
+  resolution are free text, and a resolution is typed by a person.
+- **No scripts.** The CSP is `default-src 'none'`, and the overview refreshes
+  with a meta tag. Adding JavaScript means changing the CSP on purpose.
+- **It counts and lists problems, not copies.** An unexplained mismatch is
+  recorded again every cycle, so the overview's counts and the mismatch list
+  group items by `problemKey` (order, account, check, answer). A problem is
+  resolved when any copy has a note. Each cycle's own page still shows every
+  item it recorded.
+
 ## Logs name their source
 
 Each loop gets `log.With("component", ...)` at the composition root, and every
