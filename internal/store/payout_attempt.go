@@ -188,6 +188,14 @@ func InducePayoutFailure(db *gorm.DB, orderID, kind string) error {
 	})
 }
 
+// FailureInjectionAllowed says whether an integrator may have its orders' payouts
+// fail on purpose. An integrator with no row may not.
+func FailureInjectionAllowed(db *gorm.DB, integratorID string) (bool, error) {
+	var allowed []bool
+	err := db.Model(&Integrator{}).Where("id = ?", integratorID).Pluck("allow_failure_injection", &allowed).Error
+	return len(allowed) == 1 && allowed[0], err
+}
+
 // InducedFailureOf reads an order's induced failure kind fresh from the
 // database. The worker calls it after claiming the order, so a failure induced
 // after the order was listed but before the claim is still honoured.

@@ -95,6 +95,10 @@ curl -X PUT $HOST/admin/integrators/$INTEGRATOR_ID/webhook -H "X-Admin-Key: $ADM
   -d '{"url":"https://hooks.example.com/linq"}'   # "" clears it
 ```
 
+An integrator can also set, move or clear its own webhook with its own key,
+under the same rules: `PUT /v1/webhook` with the same body. It reaches only
+that integrator's webhook.
+
 Sending a new URL later moves the webhook and keeps the secret. To replace a
 secret, send `"rotateSecret": true` with the URL. That takes effect at once, with
 no overlap, and the reply holds the new secret.
@@ -240,6 +244,8 @@ key and nothing can sweep or reclaim them afterwards.
 | `STELLAR_MAX_STREAMS` | `200` | Concurrent Horizon streams; past this, orders fall back to polling |
 | `STELLAR_ACCOUNT_POOL` | `10` | Deposit accounts kept provisioned ahead of demand, so `POST /orders` costs a database round-trip instead of a ledger close. `0` disables it and returns to provisioning inline. Each waiting account holds ~1 XLM of sponsor reserves, returned when the account is merged back after settlement |
 | `STELLAR_BASE_FEE` | `10000` stroops | Headroom for network congestion |
+| `PAYOUT_PROVIDER` | `linq` | `fake` is for the test deployment only: every payout is reported paid and no naira is sent. **Refused at startup on mainnet**, and when `STELLAR_NETWORK_PASSPHRASE` is unset, which means mainnet. See "Test mode" below |
+| `TEST_RATE_NGN` | unset | Naira per USDC that a `fake` deployment quotes at, in place of the Linq backend's rate. Required with `fake`, refused without it |
 | `PAYOUT_NEW_REFERENCE_ON_RETRY` | off | `worker` only. When exactly `true`, a payout retry after a failure the Linq backend confirms as retry-safe (`retrySafe: true` on `GET /internal/payout`) uses a new reference (`<order>-p2`, `-p3`), so the retry really pays. A failure without that confirmation stops the order in `failed` for a person to check, instead of retrying or refunding. Off, every retry reuses the order ID and reads back the first failure, then refunds after three, as before |
 
 ### SEP-10 (optional, all three or none)
@@ -329,6 +335,77 @@ unfunded sponsor or a mismatched internal secret shows up.
 
 ---
 
+## Test mode: a testnet deployment
+
+A second, separate deployment on the Stellar test network, which a reviewer can
+try with a key and `docs/test-mode.md` alone. It has its own Postgres, sponsor
+and treasury, and a fake payout provider: **no real money moves, ever.** Its
+keys start `lq_test_`.
+
+What makes it test mode:
+
+| Setting | Value | Why |
+|---|---|---|
+| `STELLAR_NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` | Testnet. `PAYOUT_PROVIDER=fake` is refused with anything else |
+| `PAYOUT_PROVIDER` | `fake` | Every payout is reported paid without calling the Linq backend |
+| `TEST_RATE_NGN` | `1500` | Orders are quoted at this fixed rate, so nothing depends on the Linq backend |
+| `STELLAR_USDC_ISSUER` | `GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5` | Circle's testnet USDC, which its faucet hands out |
+
+`LINQ_API_URL` and `LINQ_INTERNAL_SECRET` are not needed. `.env.testnet.example`
+has everything else.
+
+### Set it up (on the test server, with Docker)
+
+From a checkout of this repository on the test server:
+
+```bash
+cp .env.testnet.example .env
+docker compose build
+# New sponsor and treasury accounts, funded from Friendbot, the treasury's USDC
+# trustline, and every secret. Appended to .env:
+docker compose run --rm --no-deps -T server testnet-setup >> .env
+docker compose up -d
+curl http://localhost:8080/healthz      # {"status":"ok"}
+docker compose logs worker | grep "test mode"
+```
+
+`-T` keeps its progress messages out of `.env`. Run `testnet-setup` once.
+Running it again makes new accounts and secrets: remove the old block from
+`.env` first. If Friendbot refuses, wait a minute and run it again.
+
+Put HTTPS in front of port 8080 before handing out keys, for example Caddy with
+`reverse_proxy localhost:8080`: reviewers send their key with every request.
+
+On Koyeb instead: two more services from this repository, like the mainnet
+ones, with their own Postgres and the settings from `.env.testnet.example`. Run
+`testnet-setup` once on your own computer (`go run ./cmd/testnet-setup`) to get
+the accounts and secrets.
+
+### Make the reviewer's account
+
+```bash
+ADMIN_API_KEY=$(grep '^ADMIN_API_KEY=' .env | cut -d= -f2)
+HOST=http://localhost:8080
+curl -X POST $HOST/admin/integrators -H "X-Admin-Key: $ADMIN_API_KEY" -d '{"name":"SCF reviewer"}'
+INTEGRATOR_ID=...   # the "id" in that reply
+# Let it ask for failed payouts (there is no route for this, on purpose):
+docker compose exec db psql -U linq -d linq_stellar \
+  -c "UPDATE integrators SET allow_failure_injection = true WHERE id = '$INTEGRATOR_ID'"
+curl -X POST $HOST/admin/integrators/$INTEGRATOR_ID/keys -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+The key (`lq_test_...`) is shown only once. Make a second account the same way
+for Linq's own demos.
+
+Then put this deployment's address and its `REVIEWER_TOKEN` in
+`docs/test-mode.md`, where it says so, and give the reviewer the key.
+
+This deployment is separate from mainnet in every way: never point it at the
+mainnet database, sponsor or treasury, and never set `PAYOUT_PROVIDER=fake` on
+the mainnet services. They would refuse to start.
+
+---
+
 ## When something is wrong
 
 | Symptom | Cause |
@@ -338,6 +415,7 @@ unfunded sponsor or a mismatched internal secret shows up.
 | `POST /orders` or `GET /orders/{id}` returns 401 | `X-API-Key` is missing or doesn't match `ORDERS_API_KEY` |
 | `encryption key must be 16, 24 or 32 bytes` | `ENCRYPTION_KEY` is the wrong length. `openssl rand -hex 16` |
 | `invalid sponsor seed` | You set a public key (`G...`) where a secret seed (`S...`) belongs |
+| `PAYOUT_PROVIDER=fake is refused on mainnet` | Test mode needs `STELLAR_NETWORK_PASSPHRASE` set to the testnet passphrase |
 | Payouts fail with 503 `Internal API not configured` | `INTERNAL_API_SECRET` is not set on the Linq backend |
 | Payouts fail with 401 | `LINQ_INTERNAL_SECRET` does not match the backend's `INTERNAL_API_SECRET` |
 | Payouts fail with 404 | `/internal/payout` is not deployed on the Linq backend yet |

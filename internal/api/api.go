@@ -254,6 +254,12 @@ type CreateOrderRequest struct {
 	RefundAddress  string  `json:"refundAddress"`
 	ManualDeposit  bool    `json:"manualDeposit"`
 	IdempotencyKey string  `json:"idempotencyKey"`
+	// TestFailure makes this order's payout fail on purpose (SD-4): transient
+	// fails the first attempt, terminal every one, so the order is refunded.
+	// Only an integrator with allow_failure_injection may ask, which is Linq's
+	// own test accounts: a reviewer on the test deployment can try the failure
+	// paths with only a key. Set at creation, before any payout can start.
+	TestFailure string `json:"testFailure"`
 }
 
 func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +291,21 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		writeError(w, http.StatusInternalServerError, "could not check for an existing order")
 		return
+	}
+
+	// Before anything is priced or provisioned: an order that asked to fail
+	// and can't is refused, never quietly made to succeed.
+	if req.TestFailure != "" {
+		allowed, err := store.FailureInjectionAllowed(s.DB, integratorID(r))
+		if err != nil {
+			s.Log.Error("could not check failure injection", "integrator", integratorID(r), "error", err)
+			writeError(w, http.StatusServiceUnavailable, "could not check this account right now; try again shortly")
+			return
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "testFailure is only for test accounts that allow it")
+			return
+		}
 	}
 
 	// A refund address that cannot receive USDC is worth catching now, while
@@ -375,6 +396,7 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		BankName:        req.BankName,
 		Currency:        defaultString(req.Currency, "NGN"),
 		ManualDeposit:   req.ManualDeposit,
+		InducedFailure:  req.TestFailure,
 		DepositDeadline: time.Now().UTC().Add(s.DepositWindow),
 	}
 
@@ -673,6 +695,8 @@ func validateCreate(r CreateOrderRequest, rateRequired bool) error {
 		return errors.New("bankCode is required")
 	case r.BankAccount == "":
 		return errors.New("bankAccount is required")
+	case r.TestFailure != "" && r.TestFailure != store.InducedTransient && r.TestFailure != store.InducedTerminal:
+		return errors.New("testFailure must be transient or terminal")
 	}
 	return nil
 }

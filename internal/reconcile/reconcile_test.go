@@ -839,6 +839,24 @@ func TestOpenAccountsShareTheBudgetAndTakeTurns(t *testing.T) {
 	}
 }
 
+// On the testnet deployment the payout provider is payout.Fake. Its record is
+// the payout attempts, so a paid order and a refunded one both reconcile.
+func TestTheFakeProviderReconciles(t *testing.T) {
+	h := newHarness(t)
+	h.engine.Payouts = payout.Fake{DB: h.db}
+	paid := h.order(1, store.Order{Status: store.StateSettledInTreasury, FinancialOutcome: "disbursed",
+		AmountNGN: 10000, PayoutReference: "fake_ord_001-p2", PayoutProvider: payout.FakeProvider})
+	h.attempts(paid.ID, inducedAttempt(paid.ID), sent(paid.ID+"-p2", store.PayoutPaid))
+	refunded := h.order(2, store.Order{Status: store.StateRefunded, FinancialOutcome: "refunded"})
+	h.attempts(refunded.ID, inducedAttempt(refunded.ID), inducedAttempt(refunded.ID+"-p2"), inducedAttempt(refunded.ID+"-p3"))
+
+	_, items := h.cycle()
+	if ok := expect(t, items, paid.ID+"/payout", store.ReconcileOK); ok.Actual != "paid, ₦10000.00, payout fake_ord_001-p2 via fake" {
+		t.Errorf("paid: %q", ok.Actual)
+	}
+	expect(t, items, refunded.ID+"/payout", store.ReconcileOK)
+}
+
 // A check that passed has its answer; a mismatch is looked at again until
 // someone resolves it.
 func TestPassedAndResolvedChecksAreNotRepeated(t *testing.T) {

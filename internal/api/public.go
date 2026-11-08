@@ -71,6 +71,7 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/orders", s.requireIntegratorKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /v1/orders/{id}", s.requireIntegratorKey(s.handleOrderStatus))
 	mux.HandleFunc("POST /v1/keys/rotate", s.requireIntegratorKey(s.handleRotateOwnKey))
+	mux.HandleFunc("PUT /v1/webhook", s.requireIntegratorKey(s.handleSetOwnWebhook))
 
 	mux.HandleFunc("GET /docs", s.handleDocs)
 	mux.HandleFunc("GET /docs/{$}", s.handleDocs)
@@ -339,6 +340,25 @@ func validLimit(limit *int) bool { return limit == nil || *limit > 0 }
 // replaces the secret with no gap in the webhook. An empty url clears both.
 // Linq-B2B is refused: its webhook comes from MERCHANT_WEBHOOK_URL.
 func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
+	s.setWebhook(w, r, r.PathValue("id"), "admin")
+}
+
+// handleSetOwnWebhook lets an integrator point its own webhooks somewhere, with
+// its own key, under the same rules as the admin route. Without it a partner,
+// or a reviewer trying the test deployment with only a key, would have to ask
+// Linq to change where their own reports go.
+//
+// A key that can change the webhook can only send that integrator's reports
+// elsewhere, and the same key already reads every one of its orders. Delivery
+// still refuses private addresses at dial time (notify.NewIntegratorClient).
+func (s *Server) handleSetOwnWebhook(w http.ResponseWriter, r *http.Request) {
+	s.setWebhook(w, r, callerOf(r).integratorID, "integrator")
+}
+
+// setWebhook sets, moves or clears an integrator's webhook. A new URL with no
+// webhook before it, or with rotateSecret, gets a new signing secret, shown in
+// this reply only.
+func (s *Server) setWebhook(w http.ResponseWriter, r *http.Request, id, by string) {
 	var body struct {
 		URL          string `json:"url"`
 		RotateSecret bool   `json:"rotateSecret"`
@@ -347,7 +367,6 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	id := r.PathValue("id")
 	if id == store.LegacyIntegratorID {
 		writeError(w, http.StatusConflict, "this integrator's webhook is set by MERCHANT_WEBHOOK_URL")
 		return
@@ -362,7 +381,7 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 			s.writeCredentialError(w, "clear the webhook", err)
 			return
 		}
-		s.Log.Info("integrator webhook cleared", "integrator", id)
+		s.Log.Info("integrator webhook cleared", "integrator", id, "by", by)
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "webhookUrl": nil})
 		return
 	}
@@ -381,7 +400,7 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 			s.writeCredentialError(w, "set the webhook", err)
 			return
 		}
-		s.Log.Info("integrator webhook moved", "integrator", id)
+		s.Log.Info("integrator webhook moved", "integrator", id, "by", by)
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "webhookUrl": body.URL})
 		return
 	}
@@ -402,7 +421,7 @@ func (s *Server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.Log.Info("integrator webhook set", "integrator", id)
+	s.Log.Info("integrator webhook set", "integrator", id, "by", by)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":            id,

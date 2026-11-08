@@ -13,6 +13,7 @@ security:
 tags:
   - name: Orders
   - name: Keys
+  - name: Webhooks
 paths:
   /v1/orders:
     post:
@@ -124,6 +125,37 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/ServerError' }
         '503': { $ref: '#/components/responses/Unavailable' }
+  /v1/webhook:
+    put:
+      tags: [Webhooks]
+      operationId: setWebhook
+      summary: Set, move or stop this account's webhook
+      description: |
+        Send a `url` to have order updates delivered there. The first time, or
+        with `rotateSecret: true`, the reply holds a new `webhookSecret`, shown
+        only this once: use it to verify each delivery. Sending a different
+        `url` later keeps the secret. Send an empty `url` to stop deliveries;
+        reports already owed then wait 24 hours for a new one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetWebhookRequest' }
+      responses:
+        '200':
+          description: Where this account's webhooks now go.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Webhook' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/ServerError' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 components:
   securitySchemes:
     apiKey:
@@ -154,7 +186,7 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
           example: { message: invalid or missing X-API-Key }
     Forbidden:
-      description: This account is suspended.
+      description: This account is suspended, or asked for something it isn't allowed, such as testFailure.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -220,6 +252,15 @@ components:
         refundAddress:
           type: string
           description: Stellar account for a refund. Must be able to receive USDC. Defaults to the account that paid.
+        testFailure:
+          type: string
+          enum: [transient, terminal]
+          description: |
+            Test accounts only. Makes this order's payout fail on purpose, so
+            you can see what happens: `transient` fails the first try and the
+            retry pays; `terminal` fails every try and the USDC is refunded. An
+            account that isn't allowed gets a 403. Each try shows in the order's
+            `payoutAttempts`, with `induced: true`.
     Order:
       type: object
       required:
@@ -334,6 +375,25 @@ components:
         reason: { type: string, description: 'A fixed message, present after a payout failed.' }
         occurredAt: { type: string, format: date-time, description: When the order moved. }
         timestamp: { type: string, format: date-time, description: When this attempt was sent. }
+    SetWebhookRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          description: An https URL on a public address. Empty stops deliveries.
+          example: https://example.com/linq/webhooks
+        rotateSecret:
+          type: boolean
+          default: false
+          description: Replace the signing secret. It takes effect at once, so update your check at the same time.
+    Webhook:
+      type: object
+      required: [id, webhookUrl]
+      properties:
+        id: { type: string, description: Your account. }
+        webhookUrl: { type: string, nullable: true, description: Null once deliveries are stopped. }
+        webhookSecret: { type: string, description: 'The signing secret, present only when it is new. Shown only this once.' }
     RotatedKey:
       type: object
       required: [id, integratorId, keyPrefix, key, createdAt, previousKey]
