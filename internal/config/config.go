@@ -13,6 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/stellar/go-stellar-sdk/network"
+)
+
+// The payout providers PAYOUT_PROVIDER can name.
+const (
+	// PayoutProviderLinq pays through the Linq backend's /internal/payout.
+	PayoutProviderLinq = "linq"
+	// PayoutProviderFake pays nothing: every payout is reported paid. It exists
+	// for the testnet deployment (SD-7), and is refused on mainnet.
+	PayoutProviderFake = "fake"
 )
 
 // Config is the full service configuration.
@@ -46,6 +57,15 @@ type Config struct {
 
 	LinqAPIURL    string
 	LinqAPISecret string
+	// PayoutProvider is PayoutProviderLinq unless PAYOUT_PROVIDER says
+	// otherwise. PayoutProviderFake reports every payout as paid without
+	// calling anyone, so it is only accepted on a test network.
+	PayoutProvider string
+	// TestRateNGN is the fixed naira-per-USDC rate a fake-provider deployment
+	// quotes at (TEST_RATE_NGN), so it needs nothing from the Linq backend.
+	// Refused beside the real provider: a fixed rate there would mis-price
+	// real money.
+	TestRateNGN float64
 
 	// OrdersAPIKey guards POST /orders and GET /orders/{id} — the only routes
 	// that create a deposit account or read one back. Left optional here
@@ -121,6 +141,7 @@ func Load() (Config, error) {
 		EncryptionKey:     []byte(os.Getenv("ENCRYPTION_KEY")),
 		LinqAPIURL:        os.Getenv("LINQ_API_URL"),
 		LinqAPISecret:     os.Getenv("LINQ_INTERNAL_SECRET"),
+		PayoutProvider:    env("PAYOUT_PROVIDER", PayoutProviderLinq),
 		OrdersAPIKey:      os.Getenv("ORDERS_API_KEY"),
 		PublicAPIEnabled:  os.Getenv("PUBLIC_API_ENABLED") == "true",
 		AdminAPIKey:       os.Getenv("ADMIN_API_KEY"),
@@ -168,11 +189,35 @@ func Load() (Config, error) {
 		problems = append(problems,
 			fmt.Sprintf("ENCRYPTION_KEY must be 16, 24 or 32 bytes, got %d", len(c.EncryptionKey)))
 	}
-	if c.LinqAPIURL == "" {
-		problems = append(problems, "LINQ_API_URL is required")
-	}
-	if c.LinqAPISecret == "" {
-		problems = append(problems, "LINQ_INTERNAL_SECRET is required")
+	testRate, testRateSet, testRateErr := decimal("TEST_RATE_NGN")
+	switch c.PayoutProvider {
+	case PayoutProviderLinq:
+		if c.LinqAPIURL == "" {
+			problems = append(problems, "LINQ_API_URL is required")
+		}
+		if c.LinqAPISecret == "" {
+			problems = append(problems, "LINQ_INTERNAL_SECRET is required")
+		}
+		if testRateSet {
+			problems = append(problems, "TEST_RATE_NGN is only for PAYOUT_PROVIDER=fake; real orders are priced by the Linq backend")
+		}
+	case PayoutProviderFake:
+		// The fake reports payouts it never made. On mainnet a merchant would
+		// be told they were paid, and the payer's USDC swept to treasury, with
+		// no naira sent. An unset passphrase means mainnet to the Stellar
+		// client, so the test network must be named.
+		if c.NetworkPassphrase == "" || c.NetworkPassphrase == network.PublicNetworkPassphrase {
+			problems = append(problems, "PAYOUT_PROVIDER=fake is refused on mainnet: it reports payouts as paid without paying anyone; set STELLAR_NETWORK_PASSPHRASE to the test network's")
+		}
+		switch {
+		case testRateErr != nil:
+			problems = append(problems, "TEST_RATE_NGN must be a number of naira per USDC")
+		case !testRateSet || testRate <= 0:
+			problems = append(problems, "TEST_RATE_NGN is required with PAYOUT_PROVIDER=fake: the naira per USDC test orders are quoted at")
+		}
+		c.TestRateNGN = testRate
+	default:
+		problems = append(problems, fmt.Sprintf("PAYOUT_PROVIDER must be %q or %q, got %q", PayoutProviderLinq, PayoutProviderFake, c.PayoutProvider))
 	}
 	// A cycle reads hundreds of things from Horizon. Run back to back, it would
 	// spend the rate limit the settlement loops depend on.
@@ -217,6 +262,17 @@ func duration(key string, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+// decimal reads an optional number, saying whether it was set and whether it
+// could be read.
+func decimal(key string) (value float64, set bool, err error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, false, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	return f, true, err
 }
 
 func integer(key string, fallback int64) int64 {

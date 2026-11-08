@@ -65,13 +65,29 @@ func run() error {
 		return err
 	}
 
-	// Lets fee sponsorship recognise deposit addresses minted by the Linq
-	// backend — everything from the consumer app. Without it only this
-	// service's own orders qualify, and consumer payers keep paying their own
-	// network fee.
-	linq, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
-	if err != nil {
-		return err
+	// The rate /v1 orders are quoted at, and the lookup that lets fee
+	// sponsorship recognise deposit addresses minted by the Linq backend —
+	// everything from the consumer app. Without the lookup only this service's
+	// own orders qualify, and consumer payers keep paying their own network fee.
+	//
+	// A fake-provider deployment (testnet only; config refuses it on mainnet)
+	// talks to no Linq backend: it quotes at TEST_RATE_NGN and sponsors only
+	// its own orders.
+	var (
+		rates  api.RateSource
+		lookup api.DepositLookup
+	)
+	if cfg.PayoutProvider == config.PayoutProviderFake {
+		rates = payout.FixedRate(cfg.TestRateNGN)
+		log.Warn("test mode: orders are quoted at a fixed rate and payouts are fake",
+			"rate", cfg.TestRateNGN, "network", cfg.NetworkPassphrase)
+	} else {
+		linq, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
+		if err != nil {
+			return err
+		}
+		rates = &payout.CachedRate{Fetch: linq.OfframpRate, MaxAge: payout.RateMaxAge}
+		lookup = linq
 	}
 
 	// Signals only travel outwards from here: this process makes work for the
@@ -83,8 +99,8 @@ func run() error {
 	srv := &api.Server{
 		DB:            db,
 		Chain:         chain,
-		DepositLookup: linq,
-		Rates:         &payout.CachedRate{Fetch: linq.OfframpRate, MaxAge: payout.RateMaxAge},
+		DepositLookup: lookup,
+		Rates:         rates,
 		HomeDomain:    cfg.HomeDomain,
 		DepositWindow: cfg.DepositWindow,
 		OrdersAPIKey:  cfg.OrdersAPIKey,

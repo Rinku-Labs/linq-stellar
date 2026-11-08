@@ -73,9 +73,19 @@ func run() error {
 			"treasury", cfg.TreasuryWallet)
 	}
 
-	provider, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
-	if err != nil {
-		return err
+	// The fake pays nothing and reports every payout paid. config refuses it on
+	// mainnet; it is for the testnet deployment a reviewer can try (SD-7).
+	var provider payout.Provider
+	if cfg.PayoutProvider == config.PayoutProviderFake {
+		provider = payout.Fake{DB: db}
+		log.Warn("test mode: PAYOUT_PROVIDER=fake reports every payout paid and sends no naira",
+			"network", cfg.NetworkPassphrase)
+	} else {
+		linq, err := payout.NewLinqAPI(cfg.LinqAPIURL, cfg.LinqAPISecret)
+		if err != nil {
+			return err
+		}
+		provider = linq
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

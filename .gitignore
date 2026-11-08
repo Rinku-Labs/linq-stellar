@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.testnet.example
 
 # Build artifacts
 /bin/

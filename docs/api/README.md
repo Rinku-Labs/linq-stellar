@@ -160,7 +160,13 @@ An order also reports `statusHistory`, each move with its time, and `statusReaso
 
 ## Webhooks
 
-Linq can send order updates to a URL of yours, so you don't have to poll. Give Linq an `https` URL on a public address, and you receive a signing secret, shown only once. You can change the URL later and keep the same secret. Linq can also replace the secret, which takes effect at once, so update your check at the same time. Without a webhook, poll `GET /v1/orders/{id}`.
+Linq can send order updates to a URL of yours, so you don't have to poll. Set it with your key:
+
+```bash
+curl -X PUT $HOST/v1/webhook -H "X-API-Key: $KEY" -d '{"url":"https://example.com/linq/webhooks"}'
+```
+
+The URL must be `https` on a public address. The first reply holds `webhookSecret`, shown only once: keep it to verify deliveries. Send a different `url` later and the secret stays the same. Add `"rotateSecret": true` to replace it, which takes effect at once, so update your check at the same time. Send `{"url": ""}` to stop deliveries. Without a webhook, poll `GET /v1/orders/{id}`.
 
 You receive a `POST` with a JSON body when an order reaches one of these statuses: `deposit_detected`, `disbursed`, `settled_in_treasury`, `refund_queued`, `refunded`, `expired` or `failed`.
 

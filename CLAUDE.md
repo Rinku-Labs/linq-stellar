@@ -192,6 +192,32 @@ lanes existed. Never regenerate it to make a test pass.
   one and the sweep falls back to reading most of the table. Adding a state to
   `notifiable` means adding it there, and replacing the index.
 
+## Test mode is a separate testnet deployment
+
+`PAYOUT_PROVIDER=fake` (`payout.Fake`) reports every payout paid and sends no
+naira. It exists so a reviewer can try the whole flow on the Stellar test
+network with a key and `docs/test-mode.md` (SD-7).
+
+- **`config.Load` refuses the fake on mainnet**, and with no
+  `STELLAR_NETWORK_PASSPHRASE`, which the Stellar client reads as mainnet. A
+  fake on mainnet would tell a merchant they were paid and sweep the payer's
+  USDC with no naira sent. Keep that check where it is, in config, so neither
+  binary can start that way.
+- **`TEST_RATE_NGN` only goes with the fake**, and is refused beside the real
+  provider: a fixed rate there would mis-price real money.
+- **The fake's record is `stellar_payout_attempts`.** Its `Status` finds the
+  reference among sent (not induced) attempts, so its answers survive a
+  restart and the reconciliation's payout check agrees with it. Don't give it
+  memory of its own.
+- **`testFailure` on `POST /v1/orders`** sets `induced_failure` at creation,
+  only for an integrator with `allow_failure_injection`, checked before
+  anything is provisioned. A refused order is never quietly made to succeed.
+- **`PUT /v1/webhook`** lets an integrator set its own webhook under the admin
+  route's rules (`setWebhook`). It reaches only the caller's integrator.
+- **`cmd/testnet-setup`** makes the test deployment's sponsor and treasury,
+  funded from Friendbot. The treasury is not sponsored, so the
+  sponsored-account check does not report it.
+
 ## Payout attempts and references
 
 Each try at a payout is a `store.PayoutAttempt`, written before the request is
