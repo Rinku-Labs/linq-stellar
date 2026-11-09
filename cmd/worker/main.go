@@ -254,12 +254,17 @@ func reconciliation(db *gorm.DB, chain *stellar.Client, payouts reconcile.Payout
 // and this service spending all three of an order's attempts inside one second.
 // The same goes for a sweep or refund handed back after a Horizon failure.
 func waker(bus *wake.Bus) func(orderID, from, to string) {
-	return func(_, _, to string) {
+	return func(_, from, to string) {
 		switch to {
 		case store.StateAwaitingDeposit:
 			bus.Signal(wake.Deposits)
 		case store.StatePayoutQueued:
-			bus.Signal(wake.Payouts)
+			// Only a new payout. One handed back by the payout worker itself,
+			// still in flight or after a failure, waits out the interval, as
+			// the comment above says.
+			if from != store.StatePayoutProcessing {
+				bus.Signal(wake.Payouts)
+			}
 		case store.StateSweepQueued, store.StateRefundQueued, store.StateExpired:
 			bus.Signal(wake.Chain)
 		}
