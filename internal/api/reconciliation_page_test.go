@@ -176,8 +176,8 @@ func TestOnlyTheTokenOpensThePage(t *testing.T) {
 	}
 
 	c := p.signIn()
-	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/reconciliation" || c.MaxAge != 0 || !c.Expires.IsZero() {
-		t.Errorf("cookie should be HttpOnly, Lax, scoped to the page and end with the browser: %+v", c)
+	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/reconciliation" || c.MaxAge != 30*24*60*60 {
+		t.Errorf("cookie should be HttpOnly, Lax, scoped to the page and last 30 days: %+v", c)
 	}
 	if strings.Contains(c.Value, reviewerToken) {
 		t.Error("the cookie must not hold the token itself")
