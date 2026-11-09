@@ -38,6 +38,8 @@ const (
 	// stillRunning is how long a cycle with no finish time is assumed to be
 	// running rather than to have died partway.
 	stillRunning = time.Hour
+	// reviewerSessionDays is how long a sign-in lasts.
+	reviewerSessionDays = 30
 )
 
 func (s *Server) reconciliationRoutes(mux *http.ServeMux) {
@@ -115,9 +117,12 @@ func (s *Server) handleReviewerSignIn(w http.ResponseWriter, r *http.Request) {
 		s.renderPage(w, http.StatusUnauthorized, signInPage, signInView{Problem: "That token is not right."})
 		return
 	}
-	// No expiry: the cookie lasts until the browser closes.
+	// Remembered for reviewerSessionDays, so a reviewer opening the page often
+	// isn't asked for a 64-character token each time. The page is read-only and
+	// holds nothing private, and changing REVIEWER_TOKEN ends every session.
 	http.SetCookie(w, &http.Cookie{
 		Name: reviewerCookie, Value: s.reviewerSession(), Path: "/reconciliation",
+		MaxAge:   reviewerSessionDays * 24 * 60 * 60,
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: overHTTPS(r),
 	})
 	s.Log.Info("reconciliation sign-in")
@@ -440,7 +445,8 @@ const signInHTML = `{{define "content"}}<div class="signin">
   {{if .Problem}}<p class="problem">{{.Problem}}</p>{{end}}
   <form method="post" action="/reconciliation/sign-in">
     <label for="token">Reviewer token</label>
-    <input id="token" name="token" type="password" autocomplete="off" required autofocus>
+    <input name="username" type="text" value="reviewer" autocomplete="username" hidden>
+    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
     <button type="submit">Open</button>
   </form>
 </div>{{end}}`

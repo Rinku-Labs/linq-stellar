@@ -169,7 +169,8 @@ reconciliation tables, so it has no bank detail to show.
 | `PROOF_DEMO_INTEGRATOR_ID` | empty | Optional: the `linq-demo` integrator, whose induced failure demos the page lists |
 
 Give a reviewer the address and the token. They paste the token once; the
-browser keeps a cookie made from it (not the token itself) until it closes.
+browser keeps a cookie made from it (not the token itself) for 30 days, and a
+password manager can save the token.
 Changing `REVIEWER_TOKEN` signs every reviewer out. A script can send the token
 as a header instead:
 
