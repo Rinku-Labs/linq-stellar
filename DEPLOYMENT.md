@@ -163,6 +163,10 @@ reconciliation tables, so it has no bank detail to show.
 | Variable | Default | What it is |
 |---|---|---|
 | `REVIEWER_TOKEN` | empty | The one secret that opens the page. Empty means the page is not served at all. At least 32 characters, or the server refuses to start. Generate: `openssl rand -hex 32` |
+| `PROOF_INTEGRATOR_ID` | empty | The integrator whose orders `/reconciliation/proof` shows as the SCF D4 proof: `linq-v2-b2b`'s ID. Set with `PROOF_SINCE` |
+| `PROOF_SINCE` | empty | When routing was switched on for the business, RFC3339 (`2026-11-09T10:00:00Z`). Earlier orders settled elsewhere and are not shown |
+| `PROOF_BUSINESS_ID` | empty | Optional: only this Linq business's orders (the unaffiliated one) |
+| `PROOF_DEMO_INTEGRATOR_ID` | empty | Optional: the `linq-demo` integrator, whose induced failure demos the page lists |
 
 Give a reviewer the address and the token. They paste the token once; the
 browser keeps a cookie made from it (not the token itself) until it closes.

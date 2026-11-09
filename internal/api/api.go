@@ -56,6 +56,11 @@ type Server struct {
 	// ReviewerToken opens the read-only /reconciliation page. Empty means the
 	// page is not served at all.
 	ReviewerToken string
+	// Proof is whose orders /reconciliation/proof shows. A zero IntegratorID
+	// means the proof page says it isn't set up.
+	Proof store.ProofScope
+	// ProofDemoIntegrator is the Linq test integrator the failure demos ran on.
+	ProofDemoIntegrator string
 	// Now is the clock for credentials and rate limits. Nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger

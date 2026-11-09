@@ -67,6 +67,15 @@ type Config struct {
 	// ReviewerToken opens the read-only /reconciliation page. Empty means the
 	// page does not exist.
 	ReviewerToken string
+	// Proof says whose orders the reviewer page's D4 proof shows: the
+	// integrator (PROOF_INTEGRATOR_ID), optionally one business
+	// (PROOF_BUSINESS_ID), from when routing was switched on (PROOF_SINCE,
+	// RFC3339), and the Linq test integrator the failure demos ran on
+	// (PROOF_DEMO_INTEGRATOR_ID). Unset, the proof page says it isn't set up.
+	ProofIntegratorID     string
+	ProofBusinessID       uint
+	ProofSince            time.Time
+	ProofDemoIntegratorID string
 
 	HomeDomain       string
 	WebAuthDomain    string
@@ -150,6 +159,9 @@ func Load() (Config, error) {
 		ReconcilePayoutCalls:       int(integer("RECONCILE_PAYOUT_CALLS", 50)),
 		ReconcileSponsoredAccounts: os.Getenv("RECONCILE_SPONSORED_ACCOUNTS") == "true",
 		ReviewerToken:              os.Getenv("REVIEWER_TOKEN"),
+		ProofIntegratorID:          os.Getenv("PROOF_INTEGRATOR_ID"),
+		ProofBusinessID:            uint(integer("PROOF_BUSINESS_ID", 0)),
+		ProofDemoIntegratorID:      os.Getenv("PROOF_DEMO_INTEGRATOR_ID"),
 	}
 
 	var problems []string
@@ -186,6 +198,18 @@ func Load() (Config, error) {
 	// team. A short one could be guessed.
 	if c.ReviewerToken != "" && len(c.ReviewerToken) < minReviewerTokenLen {
 		problems = append(problems, fmt.Sprintf("REVIEWER_TOKEN must be at least %d characters; generate one with: openssl rand -hex 32", minReviewerTokenLen))
+	}
+	// Counting orders from the wrong moment would count orders that settled
+	// elsewhere, so a time that can't be read stops the start.
+	if v := os.Getenv("PROOF_SINCE"); v != "" {
+		since, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			problems = append(problems, "PROOF_SINCE must be an RFC3339 time, such as 2026-11-09T10:00:00Z")
+		}
+		c.ProofSince = since
+	}
+	if (c.ProofIntegratorID == "") != c.ProofSince.IsZero() {
+		problems = append(problems, "PROOF_INTEGRATOR_ID and PROOF_SINCE are set together")
 	}
 
 	if len(problems) > 0 {
