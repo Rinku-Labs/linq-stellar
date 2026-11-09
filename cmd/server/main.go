@@ -94,6 +94,11 @@ func run() error {
 		PublicAPIEnabled: cfg.PublicAPIEnabled,
 		AdminAPIKey:      cfg.AdminAPIKey,
 		ReviewerToken:    cfg.ReviewerToken,
+
+		Proof: store.ProofScope{
+			IntegratorID: cfg.ProofIntegratorID, BusinessID: cfg.ProofBusinessID, Since: cfg.ProofSince,
+		},
+		ProofDemoIntegrator: cfg.ProofDemoIntegratorID,
 	}
 	log.Info("public api", "enabled", cfg.PublicAPIEnabled, "adminKeySet", cfg.AdminAPIKey != "")
 	log.Info("reconciliation page", "enabled", cfg.ReviewerToken != "")

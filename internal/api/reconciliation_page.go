@@ -22,8 +22,9 @@ import (
 // mismatch and how it was explained. It is read-only and opened with
 // REVIEWER_TOKEN alone.
 //
-// It reads only the reconciliation tables, never the orders table, so it has
-// no bank detail it could show: the items were written without any.
+// It reads the reconciliation tables, which were written without any bank
+// detail. The D4 proof page (proof_page.go) also reads orders, through named
+// columns that leave bank details out.
 
 const (
 	reviewerCookie = "linq_reviewer"
@@ -43,6 +44,7 @@ func (s *Server) reconciliationRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /reconciliation", s.requireReviewer(s.handleReconciliation))
 	mux.HandleFunc("GET /reconciliation/cycles/{id}", s.requireReviewer(s.handleReconciliationCycle))
 	mux.HandleFunc("GET /reconciliation/mismatches", s.requireReviewer(s.handleReconciliationMismatches))
+	mux.HandleFunc("GET /reconciliation/proof", s.requireReviewer(s.handleProof))
 	mux.HandleFunc("POST /reconciliation/sign-in", s.handleReviewerSignIn)
 	mux.HandleFunc("POST /reconciliation/sign-out", s.handleReviewerSignOut)
 }
@@ -413,7 +415,7 @@ const layoutHTML = `{{define "layout"}}<!doctype html>
 
 const headerHTML = `{{define "header"}}<header>
   <b>Linq reconciliation</b>
-  <nav><a href="/reconciliation">Cycles</a><a href="/reconciliation/mismatches">All mismatches</a></nav>
+  <nav><a href="/reconciliation">Cycles</a><a href="/reconciliation/mismatches">All mismatches</a><a href="/reconciliation/proof">D4 proof</a></nav>
   <form method="post" action="/reconciliation/sign-out"><button type="submit">Sign out</button></form>
 </header>{{end}}`
 
