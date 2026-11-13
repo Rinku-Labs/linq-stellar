@@ -72,6 +72,12 @@ type Integrator struct {
 	WebhookClearedAt *time.Time `json:"-"`
 	// AllowFailureInjection is for Linq's own test integrators only.
 	AllowFailureInjection bool `gorm:"not null;default:false" json:"-"`
+	// AllowManualDeposit lets this integrator create manualDeposit orders on
+	// /v1, which pay for whatever arrives at the locked rate. That is a free
+	// option against Linq for the deposit window, so it is for Linq's own
+	// backend only (it already offers manual deposits to its businesses), and
+	// like AllowFailureInjection it has no route: it is set in the database.
+	AllowManualDeposit bool `gorm:"not null;default:false" json:"-"`
 	// RateLimitPerMinute overrides DefaultRateLimitPerMinute for each of this
 	// integrator's keys. Nil means the default.
 	RateLimitPerMinute *int `gorm:"check:chk_integrators_rate_limit,rate_limit_per_minute > 0" json:"rateLimitPerMinute"`
