@@ -296,6 +296,25 @@ func TestAnOrderThatMovesDuringTheCheckIsNotFlagged(t *testing.T) {
 	absent(t, items, o.ID+"/open_account")
 }
 
+// An order that expired unpaid was reclaimed with a transaction that moved no
+// USDC. Recorded as its sweep, it was reported as a sweep that moved nothing,
+// every cycle. Once Migrate moves the hash to reclaim_tx_hash, it is checked
+// only for what it is: the account is closed.
+func TestAReclaimIsNotCheckedAsASweep(t *testing.T) {
+	h := newHarness(t)
+	o := h.order(1, store.Order{Status: store.StateExpired, ReservesReclaimed: true,
+		AmountUSDC: 8.99, SweepTxHash: "merge"})
+	h.ledger.pays("merge") // closes the account; no USDC moves
+
+	if err := store.Migrate(h.db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	_, items := h.cycle()
+	absent(t, items, o.ID+"/sweep_tx")
+	absent(t, items, o.ID+"/sweep_to_treasury")
+	expect(t, items, o.ID+"/account_closed", store.ReconcileOK)
+}
+
 // 2. Every settled, refunded or reclaimed order's account is merged away.
 func TestFinishedAccountsAreClosed(t *testing.T) {
 	h := newHarness(t)
