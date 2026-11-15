@@ -99,10 +99,10 @@ func run(ctx context.Context, s settings, out, progress io.Writer, client *http.
 	for name, bytes := range map[string]int{
 		// The encryption key is used as raw bytes: 32 hex characters is
 		// AES-256's 32 bytes.
-		"ENCRYPTION_KEY": 16,
-		"ORDERS_API_KEY": 32,
-		"ADMIN_API_KEY":  32,
-		"REVIEWER_TOKEN": 32,
+		"ENCRYPTION_KEY":    16,
+		"ORDERS_API_KEY":    32,
+		"ADMIN_API_KEY":     32,
+		"REVIEWER_PASSWORD": 32,
 	} {
 		if secrets[name], err = randomHex(bytes); err != nil {
 			return err
@@ -115,12 +115,12 @@ STELLAR_TREASURY_WALLET=%s
 ENCRYPTION_KEY=%s
 ORDERS_API_KEY=%s
 ADMIN_API_KEY=%s
-REVIEWER_TOKEN=%s
+REVIEWER_PASSWORD=%s
 # The treasury's secret. The service never needs it; keep it if you want to
 # move test USDC out of the treasury.
 # TREASURY_SECRET=%s
 `, time.Now().UTC().Format("2006-01-02"), sponsor.Seed(), treasury.Address(), secrets["ENCRYPTION_KEY"],
-		secrets["ORDERS_API_KEY"], secrets["ADMIN_API_KEY"], secrets["REVIEWER_TOKEN"], treasury.Seed())
+		secrets["ORDERS_API_KEY"], secrets["ADMIN_API_KEY"], secrets["REVIEWER_PASSWORD"], treasury.Seed())
 	return err
 }
 

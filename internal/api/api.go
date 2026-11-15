@@ -53,9 +53,9 @@ type Server struct {
 	PublicAPIEnabled bool
 	// AdminAPIKey guards /admin. Empty refuses every admin request.
 	AdminAPIKey string
-	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// ReviewerPassword opens the read-only /reconciliation page. Empty means the
 	// page is not served at all.
-	ReviewerToken string
+	ReviewerPassword string
 	// Proof is whose orders /reconciliation/proof shows. A zero IntegratorID
 	// means the proof page says it isn't set up.
 	Proof store.ProofScope
@@ -111,7 +111,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /orders", s.requireAPIKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /orders/{id}", s.requireAPIKey(s.handleOrderStatus))
 
-	if s.ReviewerToken != "" {
+	if s.ReviewerPassword != "" {
 		s.reconciliationRoutes(mux)
 	}
 	if s.PublicAPIEnabled {

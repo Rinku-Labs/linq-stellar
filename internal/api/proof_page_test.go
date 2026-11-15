@@ -27,10 +27,10 @@ func proofOrder(id, integrator string, business uint, created time.Time, disburs
 	return o
 }
 
-func TestTheProofPageNeedsTheReviewerToken(t *testing.T) {
+func TestTheProofPageNeedsTheReviewerPassword(t *testing.T) {
 	p := newReviewerPage(t, network.PublicNetworkPassphrase)
 	if w := p.request("GET", "/reconciliation/proof", "", nil); w.Code == 200 {
-		t.Errorf("the proof page opened without the token: %d", w.Code)
+		t.Errorf("the proof page opened without the password: %d", w.Code)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const reviewerToken = "9f2c4b7e1a8d3f6c5b0e2a9d7c4f1b8e"
+const reviewerPassword = "9f2c4b7e1a8d3f6c5b0e2a9d7c4f1b8e"
 
 type reviewerPage struct {
 	t     *testing.T
@@ -55,7 +56,7 @@ func newReviewerPage(t *testing.T, passphrase string) *reviewerPage {
 	}
 	p := &reviewerPage{t: t, db: db, clock: time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)}
 	p.s = &Server{
-		DB: db, Chain: chain, OrdersAPIKey: "test-orders-key", ReviewerToken: reviewerToken,
+		DB: db, Chain: chain, OrdersAPIKey: "test-orders-key", ReviewerPassword: reviewerPassword,
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now: func() time.Time { return p.clock },
 	}
@@ -76,10 +77,10 @@ func (p *reviewerPage) request(method, path string, body string, header map[stri
 	return w
 }
 
-// signIn returns the session cookie a correct token earns.
+// signIn returns the session cookie a correct password earns.
 func (p *reviewerPage) signIn() *http.Cookie {
 	p.t.Helper()
-	w := p.request(http.MethodPost, "/reconciliation/sign-in", "token="+url.QueryEscape(reviewerToken), nil)
+	w := p.request(http.MethodPost, "/reconciliation/sign-in", "password="+url.QueryEscape(reviewerPassword), nil)
 	if w.Code != http.StatusSeeOther {
 		p.t.Fatalf("sign in: %d %s", w.Code, w.Body)
 	}
@@ -134,71 +135,71 @@ func (p *reviewerPage) cycle(started time.Time, finished *time.Time, errText str
 
 func at(t time.Time) *time.Time { return &t }
 
-func TestThePageExistsOnlyWithAToken(t *testing.T) {
+func TestThePageExistsOnlyWithAPassword(t *testing.T) {
 	p := newReviewerPage(t, "")
-	p.s.ReviewerToken = ""
+	p.s.ReviewerPassword = ""
 	// Not served at all: the same answer as an address this service has never
 	// had.
 	unknown := p.request(http.MethodGet, "/no-such-page", "", nil)
 	for _, path := range []string{"/reconciliation", "/reconciliation/mismatches", "/reconciliation/cycles/1"} {
 		w := p.request(http.MethodGet, path, "", nil)
-		if w.Code != unknown.Code || w.Code == http.StatusOK || strings.Contains(w.Body.String(), "Reviewer token") {
-			t.Errorf("%s with no REVIEWER_TOKEN: %d, want %d like any unknown address", path, w.Code, unknown.Code)
+		if w.Code != unknown.Code || w.Code == http.StatusOK || strings.Contains(w.Body.String(), `name="password"`) {
+			t.Errorf("%s with no REVIEWER_PASSWORD: %d, want %d like any unknown address", path, w.Code, unknown.Code)
 		}
 	}
-	if w := p.request(http.MethodPost, "/reconciliation/sign-in", "token=", nil); w.Code == http.StatusSeeOther {
-		t.Error("an empty token must not sign anyone in")
+	if w := p.request(http.MethodPost, "/reconciliation/sign-in", "password=", nil); w.Code == http.StatusSeeOther {
+		t.Error("an empty password must not sign anyone in")
 	}
 }
 
-func TestOnlyTheTokenOpensThePage(t *testing.T) {
+func TestOnlyThePasswordOpensThePage(t *testing.T) {
 	p := newReviewerPage(t, "")
 	p.cycle(p.clock.Add(-time.Hour), at(p.clock.Add(-time.Hour+time.Minute)), "",
 		store.ReconciliationItem{OrderID: "ord_secret", CheckName: "deposit_tx", Result: store.ReconcileOK})
 
 	for name, header := range map[string]map[string]string{
 		"nothing":          nil,
-		"a wrong token":    {"Authorization": "Bearer " + strings.Repeat("x", 32)},
-		"the token prefix": {"Authorization": "Bearer " + reviewerToken[:20]},
-		"a forged cookie":  {"Cookie": reviewerCookie + "=" + reviewerToken},
+		"a wrong password":    {"Authorization": "Bearer " + strings.Repeat("x", 32)},
+		"the password prefix": {"Authorization": "Bearer " + reviewerPassword[:20]},
+		"a forged cookie":  {"Cookie": reviewerCookie + "=" + reviewerPassword},
 	} {
 		for _, path := range []string{"/reconciliation", "/reconciliation/cycles/1", "/reconciliation/mismatches"} {
 			w := p.request(http.MethodGet, path, "", header)
-			if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "Reviewer token") || strings.Contains(w.Body.String(), "ord_secret") {
+			if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), `name="password"`) || strings.Contains(w.Body.String(), "ord_secret") {
 				t.Errorf("%s on %s: %d, should see only the sign-in form", name, path, w.Code)
 			}
 		}
 	}
 
-	w := p.request(http.MethodPost, "/reconciliation/sign-in", "token=wrong", nil)
-	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "That token is not right.") {
-		t.Errorf("wrong token: %d", w.Code)
+	w := p.request(http.MethodPost, "/reconciliation/sign-in", "password=wrong", nil)
+	if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "That password is not right.") {
+		t.Errorf("wrong password: %d", w.Code)
 	}
 
 	c := p.signIn()
 	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/reconciliation" || c.MaxAge != 30*24*60*60 {
 		t.Errorf("cookie should be HttpOnly, Lax, scoped to the page and last 30 days: %+v", c)
 	}
-	if strings.Contains(c.Value, reviewerToken) {
-		t.Error("the cookie must not hold the token itself")
+	if strings.Contains(c.Value, reviewerPassword) {
+		t.Error("the cookie must not hold the password itself")
 	}
 	if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Cookie": c.Name + "=" + c.Value}); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Cycles completed") {
 		t.Errorf("signed in: %d", w.Code)
 	}
-	if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerToken}); w.Code != http.StatusOK {
-		t.Errorf("the token as a Bearer header, for scripts: %d", w.Code)
+	if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerPassword}); w.Code != http.StatusOK {
+		t.Errorf("the password as a Bearer header, for scripts: %d", w.Code)
 	}
 
 	// Behind the platform's TLS proxy the cookie is Secure.
-	w = p.request(http.MethodPost, "/reconciliation/sign-in", "token="+reviewerToken, map[string]string{"X-Forwarded-Proto": "https"})
+	w = p.request(http.MethodPost, "/reconciliation/sign-in", "password="+reviewerPassword, map[string]string{"X-Forwarded-Proto": "https"})
 	if cs := w.Result().Cookies(); len(cs) != 1 || !cs[0].Secure {
 		t.Errorf("cookie over https: %+v", cs)
 	}
 
-	// Changing the token ends every session made with the old one.
-	p.s.ReviewerToken = "a-new-reviewer-token-0123456789abcdef"
+	// Changing the password ends every session made with the old one.
+	p.s.ReviewerPassword = "a-new-reviewer-password-0123456789abcdef"
 	if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Cookie": c.Name + "=" + c.Value}); w.Code != http.StatusUnauthorized {
-		t.Errorf("old session after the token changed: %d", w.Code)
+		t.Errorf("old session after the password changed: %d", w.Code)
 	}
 
 	w = p.request(http.MethodPost, "/reconciliation/sign-out", "", nil)
@@ -207,20 +208,20 @@ func TestOnlyTheTokenOpensThePage(t *testing.T) {
 	}
 }
 
-// A reviewer is handed the token, so it must open the page and nothing else,
+// A reviewer is handed the password, so it must open the page and nothing else,
 // whichever header it is put in.
-func TestTheTokenOpensNothingElse(t *testing.T) {
+func TestThePasswordOpensNothingElse(t *testing.T) {
 	p := newReviewerPage(t, "")
 	p.s.PublicAPIEnabled = true
 	p.s.AdminAPIKey = "a-separate-admin-key-0123456789abcdef"
 	session := p.signIn()
 
 	for name, header := range map[string]map[string]string{
-		"as X-Admin-Key":  {"X-Admin-Key": reviewerToken},
-		"as X-API-Key":    {"X-API-Key": reviewerToken},
-		"as a Bearer":     {"Authorization": "Bearer " + reviewerToken},
+		"as X-Admin-Key":  {"X-Admin-Key": reviewerPassword},
+		"as X-API-Key":    {"X-API-Key": reviewerPassword},
+		"as a Bearer":     {"Authorization": "Bearer " + reviewerPassword},
 		"as the cookie":   {"Cookie": session.Name + "=" + session.Value},
-		"as a raw cookie": {"Cookie": reviewerCookie + "=" + reviewerToken},
+		"as a raw cookie": {"Cookie": reviewerCookie + "=" + reviewerPassword},
 	} {
 		for _, route := range []struct{ method, path string }{
 			{http.MethodGet, "/admin/credential-events"},
@@ -230,7 +231,7 @@ func TestTheTokenOpensNothingElse(t *testing.T) {
 			{http.MethodGet, "/v1/orders/ord_1"},
 		} {
 			if w := p.request(route.method, route.path, "", header); w.Code != http.StatusUnauthorized {
-				t.Errorf("reviewer token %s on %s %s: %d, want 401", name, route.method, route.path, w.Code)
+				t.Errorf("reviewer password %s on %s %s: %d, want 401", name, route.method, route.path, w.Code)
 			}
 		}
 	}
@@ -427,7 +428,7 @@ func TestAProblemFoundEveryCycleIsCountedOnce(t *testing.T) {
 }
 
 // The page reads only the reconciliation tables, so bank details on the orders
-// they are about never reach it, nor does the token.
+// they are about never reach it, nor does the password.
 func TestNothingPrivateIsShown(t *testing.T) {
 	p := newReviewerPage(t, "")
 	p.db.Create(&store.Order{ID: "ord_private", IdempotencyKey: "ord_private", Status: store.StateSettledInTreasury,
@@ -437,7 +438,7 @@ func TestNothingPrivateIsShown(t *testing.T) {
 			Expected: "paid ₦10000.00, payout lq_1 via nomba", Actual: "failed, amount not reported, payout lq_1 via nomba"})
 	for _, path := range []string{"/reconciliation", fmt.Sprintf("/reconciliation/cycles/%d", c.ID), "/reconciliation/mismatches"} {
 		page := p.get(path)
-		for _, private := range []string{"0123456789", "Ada Lovelace", "First Bank of Testing", reviewerToken} {
+		for _, private := range []string{"0123456789", "Ada Lovelace", "First Bank of Testing", reviewerPassword} {
 			if strings.Contains(page, private) {
 				t.Errorf("%s shows %q", path, private)
 			}
@@ -460,12 +461,52 @@ func TestThePageIsLockedDown(t *testing.T) {
 	p := newReviewerPage(t, "")
 	for _, w := range []*httptest.ResponseRecorder{
 		p.request(http.MethodGet, "/reconciliation", "", nil),
-		p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerToken}),
+		p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerPassword}),
 	} {
 		h := w.Header()
 		if !strings.Contains(h.Get("Content-Security-Policy"), "default-src 'none'") || h.Get("X-Frame-Options") != "DENY" ||
 			h.Get("Cache-Control") != "no-store" || h.Get("Referrer-Policy") != "no-referrer" || h.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("headers: %v", h)
 		}
+	}
+}
+
+// A password short enough to type must not be guessable by trying them all:
+// after reviewerWrongPerMinute wrong ones, nothing is checked until the minute
+// ends, by form or by Bearer header, and the right one is refused too.
+func TestWrongPasswordsAreLimited(t *testing.T) {
+	p := newReviewerPage(t, "")
+	for i := 0; i < reviewerWrongPerMinute; i++ {
+		if w := p.request(http.MethodPost, "/reconciliation/sign-in", "password=guess"+strconv.Itoa(i), nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("wrong password %d: %d, want 401", i, w.Code)
+		}
+	}
+	w := p.request(http.MethodPost, "/reconciliation/sign-in", "password="+url.QueryEscape(reviewerPassword), nil)
+	if w.Code != http.StatusTooManyRequests || !strings.Contains(w.Body.String(), "Too many wrong passwords") {
+		t.Errorf("right password after the limit: %d, want 429", w.Code)
+	}
+	if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerPassword}); w.Code != http.StatusTooManyRequests {
+		t.Errorf("Bearer after the limit: %d, want 429", w.Code)
+	}
+
+	// The next minute starts fresh.
+	p.clock = p.clock.Add(time.Minute)
+	p.signIn()
+}
+
+// Only wrong passwords count, so a script using the right one is never locked
+// out, and wrong Bearer headers count like wrong form posts.
+func TestOnlyWrongPasswordsCount(t *testing.T) {
+	p := newReviewerPage(t, "")
+	for i := 0; i < reviewerWrongPerMinute*2; i++ {
+		if w := p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer " + reviewerPassword}); w.Code != http.StatusOK {
+			t.Fatalf("right password %d: %d", i, w.Code)
+		}
+	}
+	for i := 0; i < reviewerWrongPerMinute; i++ {
+		p.request(http.MethodGet, "/reconciliation", "", map[string]string{"Authorization": "Bearer wrong"})
+	}
+	if w := p.request(http.MethodPost, "/reconciliation/sign-in", "password="+url.QueryEscape(reviewerPassword), nil); w.Code != http.StatusTooManyRequests {
+		t.Errorf("after wrong Bearer headers: %d, want 429", w.Code)
 	}
 }

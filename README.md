@@ -128,7 +128,7 @@ them shows both the payer and the amount for every order.
 Every 15 minutes the service checks its books against that same ledger and
 records what it finds. `$SERVICE/reconciliation` shows every cycle, every check
 and every mismatch with how it was explained, each transaction linked to
-Stellar Expert. It needs a reviewer token; ask us for one. It shows no bank
+Stellar Expert. It needs a reviewer password; ask us for one. It shows no bank
 details.
 
 ### How an amount is quoted

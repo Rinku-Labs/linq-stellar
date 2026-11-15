@@ -292,17 +292,20 @@ engine that "fixed" a balance it had misread would move money on a bug.
 ## The reconciliation page is for people outside Linq
 
 `/reconciliation` (`internal/api/reconciliation_page.go`) shows a reviewer the
-cycles and items, and is opened with `REVIEWER_TOKEN` alone. It is only served
+cycles and items, and is opened with `REVIEWER_PASSWORD` alone. It is only served
 when that is set.
 
 - **It reads the reconciliation tables and nothing else.** That is why it can
   promise no bank detail: the items were written without any. Do not join it to
   `orders` to show more; a merchant's account number is one join away.
-- **The cookie holds an HMAC of a fixed label under the token, never the
-  token.** It proves the browser was given the token, and stops working when the
-  token changes. Compare with `sameSecret`, which hashes both sides before a
+- **The cookie holds an HMAC of a fixed label under the password, never the
+  password.** It proves the browser was given the password, and stops working
+  when the password changes. Compare with `sameSecret`, which hashes both sides before a
   constant-time compare so a length leaks nothing either.
-- **The token opens this page only.** Not `/admin`, not `/v1`. Keep it a
+- **Every password check goes through `checkReviewerPassword`**, form or
+  Bearer header. The password is short enough to type, so the per-minute limit
+  on wrong ones is what stops guessing; a check that skips it reopens that.
+- **The password opens this page only.** Not `/admin`, not `/v1`. Keep it a
   separate secret from `ADMIN_API_KEY`: a reviewer is given it.
 - **`html/template`, never `text/template`.** `expected`, `actual` and a
   resolution are free text, and a resolution is typed by a person.

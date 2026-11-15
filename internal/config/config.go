@@ -84,9 +84,9 @@ type Config struct {
 	// AdminAPIKey guards /admin, sent as X-Admin-Key. Empty refuses every admin
 	// request; the server still starts, so the legacy routes never depend on it.
 	AdminAPIKey string
-	// ReviewerToken opens the read-only /reconciliation page. Empty means the
+	// ReviewerPassword opens the read-only /reconciliation page. Empty means the
 	// page does not exist.
-	ReviewerToken string
+	ReviewerPassword string
 	// Proof says whose orders the reviewer page's D4 proof shows: the
 	// integrator (PROOF_INTEGRATOR_ID), optionally one business
 	// (PROOF_BUSINESS_ID), from when routing was switched on (PROOF_SINCE,
@@ -128,8 +128,10 @@ type Config struct {
 	ReconcileSponsoredAccounts bool
 }
 
-// minReviewerTokenLen is the shortest REVIEWER_TOKEN accepted.
-const minReviewerTokenLen = 32
+// minReviewerPasswordLen is the shortest REVIEWER_PASSWORD accepted. Short
+// enough to type, because a reviewer types it; the sign-in limit
+// (reviewerWrongPerMinute in internal/api) is what stops guessing.
+const minReviewerPasswordLen = 12
 
 // Load reads configuration from the environment.
 //
@@ -179,7 +181,7 @@ func Load() (Config, error) {
 		ReconcileHorizonCalls:      int(integer("RECONCILE_HORIZON_CALLS", 200)),
 		ReconcilePayoutCalls:       int(integer("RECONCILE_PAYOUT_CALLS", 50)),
 		ReconcileSponsoredAccounts: os.Getenv("RECONCILE_SPONSORED_ACCOUNTS") == "true",
-		ReviewerToken:              os.Getenv("REVIEWER_TOKEN"),
+		ReviewerPassword:              os.Getenv("REVIEWER_PASSWORD"),
 		ProofIntegratorID:          os.Getenv("PROOF_INTEGRATOR_ID"),
 		ProofBusinessID:            uint(integer("PROOF_BUSINESS_ID", 0)),
 		ProofDemoIntegratorID:      os.Getenv("PROOF_DEMO_INTEGRATOR_ID"),
@@ -239,10 +241,14 @@ func Load() (Config, error) {
 	if c.ReconcileHorizonCalls < 0 || c.ReconcilePayoutCalls < 0 {
 		problems = append(problems, "RECONCILE_HORIZON_CALLS and RECONCILE_PAYOUT_CALLS cannot be negative")
 	}
-	// The token is the page's only lock, and it is given to people outside the
-	// team. A short one could be guessed.
-	if c.ReviewerToken != "" && len(c.ReviewerToken) < minReviewerTokenLen {
-		problems = append(problems, fmt.Sprintf("REVIEWER_TOKEN must be at least %d characters; generate one with: openssl rand -hex 32", minReviewerTokenLen))
+	// The password is the page's only lock, and it is given to people outside
+	// the team. A short one could be guessed.
+	if c.ReviewerPassword != "" && len(c.ReviewerPassword) < minReviewerPasswordLen {
+		problems = append(problems, fmt.Sprintf("REVIEWER_PASSWORD must be at least %d characters", minReviewerPasswordLen))
+	}
+	// Ignoring the old name would take the page down without a word.
+	if os.Getenv("REVIEWER_TOKEN") != "" {
+		problems = append(problems, "REVIEWER_TOKEN was renamed REVIEWER_PASSWORD; set that and remove REVIEWER_TOKEN")
 	}
 	// Counting orders from the wrong moment would count orders that settled
 	// elsewhere, so a time that can't be read stops the start.
