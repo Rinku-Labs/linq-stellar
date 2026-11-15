@@ -5,7 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/network"
 )
 
 func (p *publicAPI) setWebhook(t *testing.T, integrator, body string) (int, map[string]any) {
@@ -166,7 +169,8 @@ func TestSettingAWebhookNeedsAnExistingIntegrator(t *testing.T) {
 	}
 }
 
-// An integrator's key must not be able to redirect events, its own or anyone's.
+// An integrator's key can't use the admin route, for its own webhook or anyone
+// else's. It sets its own through PUT /v1/webhook.
 func TestOnlyTheAdminKeySetsWebhooks(t *testing.T) {
 	p := newPublicAPI(t)
 	id := p.integrator(t, "A")
@@ -178,5 +182,134 @@ func TestOnlyTheAdminKeySetsWebhooks(t *testing.T) {
 		if w != http.StatusUnauthorized {
 			t.Errorf("%s: status = %d, want 401", name, w)
 		}
+	}
+}
+
+func (p *publicAPI) setOwnWebhook(t *testing.T, key, body string) (int, map[string]any) {
+	t.Helper()
+	w := p.asKey(key, http.MethodPut, "/v1/webhook", body)
+	out := map[string]any{"cache": w.Header().Get("Cache-Control")}
+	if strings.HasPrefix(w.Body.String(), "{") {
+		for k, v := range decode(t, w) {
+			out[k] = v
+		}
+	}
+	return w.Code, out
+}
+
+// A partner, or a reviewer on the test deployment, points its own webhooks
+// somewhere with its own key, under the admin route's rules.
+func TestAnIntegratorSetsItsOwnWebhook(t *testing.T) {
+	p := newTestnetPublicAPI(t)
+	id := p.integrator(t, "Reviewer")
+	_, key := p.issue(t, id)
+	schema := loadSpec(t).Components.Schemas["Webhook"]
+	stored := func() store.Integrator {
+		var row store.Integrator
+		p.db.First(&row, "id = ?", id)
+		return row
+	}
+
+	code, set := p.setOwnWebhook(t, key, `{"url":"https://hooks.example.com/linq"}`)
+	secret, _ := set["webhookSecret"].(string)
+	if code != http.StatusOK || !strings.HasPrefix(secret, "whsec_") || set["cache"] != "no-store" || set["id"] != id {
+		t.Fatalf("set: %d %v", code, set)
+	}
+	delete(set, "cache")
+	assertMatchesSchema(t, schema, set)
+	if row := stored(); row.WebhookURL != "https://hooks.example.com/linq" {
+		t.Errorf("url = %q", row.WebhookURL)
+	}
+	if strings.Contains(p.logs.String(), secret) {
+		t.Error("the secret was logged")
+	}
+
+	// Moving keeps the secret, and says nothing of it.
+	sealed := stored().WebhookSecretEncrypted
+	if code, moved := p.setOwnWebhook(t, key, `{"url":"https://new.example.com/linq"}`); code != http.StatusOK || moved["webhookSecret"] != nil {
+		t.Errorf("move: %d %v", code, moved)
+	}
+	if row := stored(); row.WebhookURL != "https://new.example.com/linq" || row.WebhookSecretEncrypted != sealed {
+		t.Errorf("after the move: %q, secret kept = %v", row.WebhookURL, row.WebhookSecretEncrypted == sealed)
+	}
+
+	// Rotating mints a new one.
+	if code, rotated := p.setOwnWebhook(t, key, `{"url":"https://new.example.com/linq","rotateSecret":true}`); code != http.StatusOK || rotated["webhookSecret"] == nil || rotated["webhookSecret"] == secret {
+		t.Errorf("rotate: %d %v", code, rotated)
+	}
+
+	// Clearing stops deliveries.
+	code, cleared := p.setOwnWebhook(t, key, `{"url":""}`)
+	if code != http.StatusOK || cleared["webhookUrl"] != nil || stored().WebhookURL != "" {
+		t.Errorf("clear: %d %v", code, cleared)
+	}
+	delete(cleared, "cache")
+	assertMatchesSchema(t, schema, cleared)
+}
+
+// The key reaches its own integrator's webhook and nobody else's, and the same
+// URL checks apply.
+func TestAnIntegratorsKeyOnlyReachesItsOwnWebhook(t *testing.T) {
+	p := newTestnetPublicAPI(t)
+	mine := p.integrator(t, "Mine")
+	theirs := p.integrator(t, "Theirs")
+	_, key := p.issue(t, mine)
+	p.setWebhook(t, theirs, `{"url":"https://theirs.example.com/hook"}`)
+
+	if code, _ := p.setOwnWebhook(t, key, `{"url":"https://mine.example.com/hook","id":"`+theirs+`"}`); code != http.StatusOK {
+		t.Fatalf("set: %d", code)
+	}
+	var row store.Integrator
+	p.db.First(&row, "id = ?", theirs)
+	if row.WebhookURL != "https://theirs.example.com/hook" {
+		t.Errorf("another integrator's webhook moved to %q", row.WebhookURL)
+	}
+
+	for _, url := range []string{"http://hooks.example.com", "https://169.254.169.254/latest/meta-data/", "https://127.0.0.1/hook"} {
+		if code, _ := p.setOwnWebhook(t, key, `{"url":"`+url+`"}`); code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", url, code)
+		}
+	}
+	for name, headers := range map[string]map[string]string{
+		"no key":        nil,
+		"the admin key": {"X-API-Key": p.AdminAPIKey},
+	} {
+		if w := p.send(http.MethodPut, "/v1/webhook", `{"url":"https://x.example.com"}`, headers); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, w.Code)
+		}
+	}
+}
+
+// newTestnetPublicAPI is the public API as the test deployment runs it.
+func newTestnetPublicAPI(t *testing.T) *publicAPI {
+	t.Helper()
+	p := newPublicAPI(t)
+	sponsor, _ := keypair.Random()
+	chain, err := stellar.New(stellar.Config{
+		SponsorSeed:       sponsor.Seed(),
+		EncryptionKey:     []byte("0123456789abcdef0123456789abcdef"),
+		NetworkPassphrase: network.TestNetworkPassphrase,
+	})
+	if err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	p.Chain = chain
+	return p
+}
+
+// On mainnet an integrator's key can't move its own webhook; Linq sets it
+// through the admin route. The route exists on the test network only.
+func TestAnIntegratorCantSetItsOwnWebhookOnMainnet(t *testing.T) {
+	p := newPublicAPI(t)
+	id := p.integrator(t, "Live")
+	_, key := p.issue(t, id)
+	// No route: 404, or 405 since the mux has others under /v1.
+	if w := p.asKey(key, http.MethodPut, "/v1/webhook", `{"url":"https://hooks.example.com/linq"}`); w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want no such route", w.Code)
+	}
+	var row store.Integrator
+	p.db.First(&row, "id = ?", id)
+	if row.WebhookURL != "" {
+		t.Errorf("webhook set to %q on mainnet", row.WebhookURL)
 	}
 }

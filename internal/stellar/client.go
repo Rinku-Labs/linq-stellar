@@ -31,6 +31,11 @@ import (
 // constant or explicitly configured.
 const DefaultUSDCIssuer = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
 
+// TestnetUSDCIssuer is Circle's USDC issuer on the Stellar test network: the
+// asset its faucet (faucet.circle.com) hands out, and the one a test
+// deployment settles in.
+const TestnetUSDCIssuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+
 // defaultBaseFee sits well above the network minimum so orders still confirm
 // when Stellar is congested. A deposit that cannot be swept because the fee was
 // too low costs far more than the fee ever would.

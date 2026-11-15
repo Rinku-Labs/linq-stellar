@@ -55,6 +55,7 @@ holds funds only between deposit and sweep.
 |---|---|
 | `cmd/server` | HTTP API and the Horizon stream listener |
 | `cmd/worker` | Settlement workers: sweep, refund, payout dispatch |
+| `cmd/testnet-setup` | One-time setup of a test deployment's testnet accounts and secrets |
 | `internal/stellar` | Keypairs, provisioning, sweep, balances, trustlines |
 | `internal/settle` | Deposit detection, claiming, refunds |
 | `internal/payout` | NGN disbursement via the Linq B2B API |
