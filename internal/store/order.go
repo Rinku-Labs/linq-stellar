@@ -100,6 +100,11 @@ type Order struct {
 	// SweepTxHash moves USDC to treasury and merges the account back to the
 	// sponsor, returning every sponsored lumen in the same transaction.
 	SweepTxHash string `json:"sweepTxHash"`
+	// ReclaimTxHash closes the account of an order that expired unpaid. It
+	// moves no USDC, so it is never a sweep: reconciliation checks a sweep for
+	// the USDC it moved to treasury, and would report every reclaim as a sweep
+	// that moved nothing.
+	ReclaimTxHash string `gorm:"not null;default:''" json:"reclaimTxHash"`
 	// RefundAddress must already hold a USDC trustline or a refund cannot land.
 	// Verified at order creation, not at refund time, so a bad address is caught
 	// while the payer is still on screen.

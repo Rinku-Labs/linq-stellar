@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func required(t *testing.T) {
@@ -119,4 +120,26 @@ func TestTheFakeProviderIsOnlyForATestNetwork(t *testing.T) {
 		_, err := Load()
 		refused(t, err, `PAYOUT_PROVIDER must be "linq" or "fake", got "nomba"`)
 	})
+}
+
+func TestProofSettings(t *testing.T) {
+	required(t)
+	t.Setenv("PROOF_INTEGRATOR_ID", "int_v2")
+	t.Setenv("PROOF_SINCE", "yesterday")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "PROOF_SINCE") {
+		t.Errorf("an unreadable PROOF_SINCE was accepted: %v", err)
+	}
+	t.Setenv("PROOF_SINCE", "")
+	if _, err := Load(); err == nil {
+		t.Errorf("PROOF_INTEGRATOR_ID without PROOF_SINCE was accepted")
+	}
+	t.Setenv("PROOF_SINCE", "2026-11-09T10:00:00Z")
+	t.Setenv("PROOF_BUSINESS_ID", "7")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.ProofIntegratorID != "int_v2" || c.ProofBusinessID != 7 || c.ProofSince.Format(time.RFC3339) != "2026-11-09T10:00:00Z" {
+		t.Errorf("proof settings = %q %d %v", c.ProofIntegratorID, c.ProofBusinessID, c.ProofSince)
+	}
 }

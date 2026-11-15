@@ -207,13 +207,18 @@ func (w *ChainWorker) reclaim(order *store.Order) {
 		return
 	}
 
-	// An empty hash means there was nothing left to close, which is a finished
-	// outcome rather than a reason to look again. Marking it is what stops this
-	// order being re-checked against Horizon on every pass for the life of the
-	// service.
+	w.recordReclaim(order, hash)
+}
+
+// recordReclaim marks an expired order reclaimed and keeps the hash of the
+// transaction that closed its account. An empty hash means there was nothing
+// left to close, which is a finished outcome rather than a reason to look
+// again. Marking it is what stops this order being re-checked against Horizon
+// on every pass for the life of the service.
+func (w *ChainWorker) recordReclaim(order *store.Order, hash string) {
 	fields := map[string]any{}
 	if hash != "" {
-		fields["sweep_tx_hash"] = hash
+		fields["reclaim_tx_hash"] = hash
 	}
 	w.markReclaimed(order, fields)
 

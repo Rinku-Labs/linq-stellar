@@ -56,6 +56,11 @@ type Server struct {
 	// ReviewerToken opens the read-only /reconciliation page. Empty means the
 	// page is not served at all.
 	ReviewerToken string
+	// Proof is whose orders /reconciliation/proof shows. A zero IntegratorID
+	// means the proof page says it isn't set up.
+	Proof store.ProofScope
+	// ProofDemoIntegrator is the Linq test integrator the failure demos ran on.
+	ProofDemoIntegrator string
 	// Now is the clock for credentials and rate limits. Nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
@@ -270,7 +275,15 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	ownQuote := callerOf(r).legacy()
 	if !ownQuote {
-		if err := refuseCallerQuote(req); err != nil {
+		manualAllowed := false
+		if req.ManualDeposit {
+			var err error
+			if manualAllowed, err = s.manualDepositAllowed(integratorID(r)); err != nil {
+				writeError(w, http.StatusInternalServerError, "could not check the integrator")
+				return
+			}
+		}
+		if err := refuseCallerQuote(req, manualAllowed); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -656,6 +669,17 @@ func (s *Server) paymentURI(o *store.Order) (string, error) {
 
 const maxIdempotencyKeyLength = 255
 
+// manualDepositAllowed reports whether an integrator may create manualDeposit
+// orders on /v1. See store.Integrator.AllowManualDeposit.
+func (s *Server) manualDepositAllowed(integratorID string) (bool, error) {
+	var integrator store.Integrator
+	err := s.DB.Select("id", "allow_manual_deposit").First(&integrator, "id = ?", integratorID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	return integrator.AllowManualDeposit, err
+}
+
 // refuseCallerQuote keeps the exchange rate out of a /v1 caller's hands.
 // Settlement pays QuotedNGN once QuotedUSDC arrives, so whoever sets the rate, or
 // both sides of the quote, decides what a deposit is worth: 0.01 USDC against
@@ -664,9 +688,11 @@ const maxIdempotencyKeyLength = 255
 //
 // manualDeposit goes too: it pays for whatever arrives at the locked rate, which
 // would be a free option against Linq, of any size, for the whole deposit window.
-func refuseCallerQuote(r CreateOrderRequest) error {
+// The one exception is an integrator with AllowManualDeposit, set by hand for
+// Linq's own backend, which already offers manual deposits to its businesses.
+func refuseCallerQuote(r CreateOrderRequest, manualAllowed bool) error {
 	switch {
-	case r.ManualDeposit:
+	case r.ManualDeposit && !manualAllowed:
 		return errors.New("manualDeposit is not available on this API")
 	case r.Rate != 0:
 		return errors.New("rate is set by this service; leave it out")

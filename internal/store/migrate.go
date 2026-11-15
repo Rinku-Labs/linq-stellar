@@ -55,7 +55,24 @@ func migrate(db *gorm.DB) error {
 	if err := protectCredentialEvents(db); err != nil {
 		return err
 	}
+	if err := moveReclaimHashes(db); err != nil {
+		return err
+	}
 	return createWorkerIndexes(db)
+}
+
+// moveReclaimHashes moves each reclaim transaction out of sweep_tx_hash, where
+// the reclaim worker used to record it, into reclaim_tx_hash. An expired order
+// is never swept: the sweep worker only takes orders that were paid out. So a
+// hash in sweep_tx_hash on an expired order is always a reclaim, and
+// reconciliation reported it as a sweep that moved no USDC, every cycle.
+//
+// It changes nothing once every such row is moved, so it is safe on every boot.
+func moveReclaimHashes(db *gorm.DB) error {
+	return db.Exec(`UPDATE stellar_orders
+		SET reclaim_tx_hash = sweep_tx_hash, sweep_tx_hash = ''
+		WHERE status = ? AND reserves_reclaimed = ? AND sweep_tx_hash <> '' AND reclaim_tx_hash = ''`,
+		StateExpired, true).Error
 }
 
 // protectCredentialEvents makes the rotation and revocation proof append-only:

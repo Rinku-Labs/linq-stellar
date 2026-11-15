@@ -178,7 +178,8 @@ func TestTheRequestSchemaMatchesTheHandler(t *testing.T) {
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// Accepted only from the legacy caller.
+	// rate: accepted only from the legacy caller. manualDeposit: the legacy
+	// caller, and integrators Linq allows by hand, so not part of the public API.
 	delete(fields, "rate")
 	delete(fields, "manualDeposit")
 
