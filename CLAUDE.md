@@ -213,7 +213,9 @@ network with a key and `docs/test-mode.md` (SD-7).
   only for an integrator with `allow_failure_injection`, checked before
   anything is provisioned. A refused order is never quietly made to succeed.
 - **`PUT /v1/webhook`** lets an integrator set its own webhook under the admin
-  route's rules (`setWebhook`). It reaches only the caller's integrator.
+  route's rules (`setWebhook`). It reaches only the caller's integrator, and is
+  registered **on the test network only**: on mainnet Linq sets webhooks through
+  the admin route until a live key moving its own reports has been decided.
 - **`cmd/testnet-setup`** makes the test deployment's sponsor and treasury,
   funded from Friendbot. The treasury is not sponsored, so the
   sponsored-account check does not report it.

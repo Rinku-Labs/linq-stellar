@@ -19,13 +19,13 @@ The test deployment:
 
 | | |
 |---|---|
-| Address | `https://<test-host>` (Linq fills this in when the deployment is up) |
+| Address | `https://stellartestmode.brimble.app` |
 | Reconciliation page token | `<reviewer-token>` (likewise) |
 
 Set these in your terminal, and keep it open for the whole walkthrough:
 
 ```bash
-export HOST=https://<test-host>
+export HOST=https://stellartestmode.brimble.app
 export KEY=lq_test_...        # your key
 ```
 

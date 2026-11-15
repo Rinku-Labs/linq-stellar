@@ -12,6 +12,7 @@ import (
 	"github.com/Rinku-Labs/linq-stellar/internal/apikey"
 	"github.com/Rinku-Labs/linq-stellar/internal/notify"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/stellar/go-stellar-sdk/network"
 	"gorm.io/gorm"
 )
 
@@ -71,7 +72,13 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/orders", s.requireIntegratorKey(s.handleCreateOrder))
 	mux.HandleFunc("GET /v1/orders/{id}", s.requireIntegratorKey(s.handleOrderStatus))
 	mux.HandleFunc("POST /v1/keys/rotate", s.requireIntegratorKey(s.handleRotateOwnKey))
-	mux.HandleFunc("PUT /v1/webhook", s.requireIntegratorKey(s.handleSetOwnWebhook))
+	// Test network only. On mainnet Linq sets an integrator's webhook
+	// (PUT /admin/integrators/{id}/webhook) until letting a live key move where
+	// its own reports go has been decided. On the test deployment a reviewer
+	// has only a key, and needs to point the reports at a page they control.
+	if s.Chain.NetworkPassphrase() == network.TestNetworkPassphrase {
+		mux.HandleFunc("PUT /v1/webhook", s.requireIntegratorKey(s.handleSetOwnWebhook))
+	}
 
 	mux.HandleFunc("GET /docs", s.handleDocs)
 	mux.HandleFunc("GET /docs/{$}", s.handleDocs)

@@ -5,7 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Rinku-Labs/linq-stellar/internal/stellar"
 	"github.com/Rinku-Labs/linq-stellar/internal/store"
+	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/network"
 )
 
 func (p *publicAPI) setWebhook(t *testing.T, integrator, body string) (int, map[string]any) {
@@ -197,7 +200,7 @@ func (p *publicAPI) setOwnWebhook(t *testing.T, key, body string) (int, map[stri
 // A partner, or a reviewer on the test deployment, points its own webhooks
 // somewhere with its own key, under the admin route's rules.
 func TestAnIntegratorSetsItsOwnWebhook(t *testing.T) {
-	p := newPublicAPI(t)
+	p := newTestnetPublicAPI(t)
 	id := p.integrator(t, "Reviewer")
 	_, key := p.issue(t, id)
 	schema := loadSpec(t).Components.Schemas["Webhook"]
@@ -247,7 +250,7 @@ func TestAnIntegratorSetsItsOwnWebhook(t *testing.T) {
 // The key reaches its own integrator's webhook and nobody else's, and the same
 // URL checks apply.
 func TestAnIntegratorsKeyOnlyReachesItsOwnWebhook(t *testing.T) {
-	p := newPublicAPI(t)
+	p := newTestnetPublicAPI(t)
 	mine := p.integrator(t, "Mine")
 	theirs := p.integrator(t, "Theirs")
 	_, key := p.issue(t, mine)
@@ -274,5 +277,39 @@ func TestAnIntegratorsKeyOnlyReachesItsOwnWebhook(t *testing.T) {
 		if w := p.send(http.MethodPut, "/v1/webhook", `{"url":"https://x.example.com"}`, headers); w.Code != http.StatusUnauthorized {
 			t.Errorf("%s: status = %d, want 401", name, w.Code)
 		}
+	}
+}
+
+// newTestnetPublicAPI is the public API as the test deployment runs it.
+func newTestnetPublicAPI(t *testing.T) *publicAPI {
+	t.Helper()
+	p := newPublicAPI(t)
+	sponsor, _ := keypair.Random()
+	chain, err := stellar.New(stellar.Config{
+		SponsorSeed:       sponsor.Seed(),
+		EncryptionKey:     []byte("0123456789abcdef0123456789abcdef"),
+		NetworkPassphrase: network.TestNetworkPassphrase,
+	})
+	if err != nil {
+		t.Fatalf("chain: %v", err)
+	}
+	p.Chain = chain
+	return p
+}
+
+// On mainnet an integrator's key can't move its own webhook; Linq sets it
+// through the admin route. The route exists on the test network only.
+func TestAnIntegratorCantSetItsOwnWebhookOnMainnet(t *testing.T) {
+	p := newPublicAPI(t)
+	id := p.integrator(t, "Live")
+	_, key := p.issue(t, id)
+	// No route: 404, or 405 since the mux has others under /v1.
+	if w := p.asKey(key, http.MethodPut, "/v1/webhook", `{"url":"https://hooks.example.com/linq"}`); w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want no such route", w.Code)
+	}
+	var row store.Integrator
+	p.db.First(&row, "id = ?", id)
+	if row.WebhookURL != "" {
+		t.Errorf("webhook set to %q on mainnet", row.WebhookURL)
 	}
 }

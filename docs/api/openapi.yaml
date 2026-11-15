@@ -129,8 +129,11 @@ paths:
     put:
       tags: [Webhooks]
       operationId: setWebhook
-      summary: Set, move or stop this account's webhook
+      summary: Set, move or stop this account's webhook (test mode only)
       description: |
+        Available on the test deployment only. On mainnet Linq sets the
+        webhook for you.
+
         Send a `url` to have order updates delivered there. The first time, or
         with `rotateSecret: true`, the reply holds a new `webhookSecret`, shown
         only this once: use it to verify each delivery. Sending a different

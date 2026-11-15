@@ -160,7 +160,7 @@ An order also reports `statusHistory`, each move with its time, and `statusReaso
 
 ## Webhooks
 
-Linq can send order updates to a URL of yours, so you don't have to poll. Set it with your key:
+Linq can send order updates to a URL of yours, so you don't have to poll. On mainnet, Linq sets it for you: send us the URL. In test mode you set it yourself with your key:
 
 ```bash
 curl -X PUT $HOST/v1/webhook -H "X-API-Key: $KEY" -d '{"url":"https://example.com/linq/webhooks"}'
@@ -227,4 +227,13 @@ Request bodies over 64 KiB are refused with `400`.
 
 ## Test mode
 
-**Coming soon.** Test mode isn't available yet. It will be a separate deployment on the Stellar test network, with its own host and its own `lq_test_` keys.
+Test mode is a separate deployment on the Stellar test network: https://stellartestmode.brimble.app
+
+It has its own database and its own `lq_test_` keys; a live key doesn't work there, and a test key doesn't work on mainnet. Requests and replies are the same as on mainnet, so to go live you change the host and the key and nothing else. What differs:
+
+- You pay with test USDC from Circle's faucet, which is worth nothing.
+- No naira is sent. Every payout is reported paid, with a reference starting `fake_`.
+- The rate is fixed, so amounts are predictable.
+- You set your own webhook with `PUT /v1/webhook`, which exists only here.
+
+Ask Linq for a test key. The walkthrough, about 20 minutes from first request to a refunded order, is `docs/test-mode.md` in the repository.

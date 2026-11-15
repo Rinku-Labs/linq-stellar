@@ -198,10 +198,20 @@ func TestTheRequestSchemaMatchesTheHandler(t *testing.T) {
 
 // Every claim in the docs has to be true today, so the test deployment is not
 // described as if it exists. Remove this when SD-7 is live.
-func TestTestModeIsMarkedComingSoon(t *testing.T) {
+// Test mode is live, so the guide gives its address and the walkthrough, and
+// the walkthrough has no placeholder left for a reader to trip on.
+func TestTestModeGivesItsAddressAndWalkthrough(t *testing.T) {
 	_, section, found := strings.Cut(string(docs.Guide), "## Test mode")
-	if !found || !strings.Contains(section, "Coming soon") {
-		t.Error("the guide presents test mode as available")
+	if !found || strings.Contains(section, "Coming soon") ||
+		!strings.Contains(section, "https://") || !strings.Contains(section, "docs/test-mode.md") {
+		t.Error("the guide's test mode section lacks the address or the walkthrough")
+	}
+	walkthrough, err := os.ReadFile("../../docs/test-mode.md")
+	if err != nil {
+		t.Fatalf("read walkthrough: %v", err)
+	}
+	if strings.Contains(string(walkthrough), "<test-host>") {
+		t.Error("docs/test-mode.md still has the <test-host> placeholder")
 	}
 }
 
