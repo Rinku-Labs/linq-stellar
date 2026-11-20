@@ -216,6 +216,12 @@ network with a key and `docs/test-mode.md` (SD-7).
   route's rules (`setWebhook`). It reaches only the caller's integrator, and is
   registered **on the test network only**: on mainnet Linq sets webhooks through
   the admin route until a live key moving its own reports has been decided.
+- **`/console`** (`internal/api/console.go`) is a browser page for trying `/v1`
+  with a test key. It is registered beside `PUT /v1/webhook`, **on the test
+  network only**: it keeps a key in a browser tab, and a live key belongs in a
+  server. It calls `/v1` and nothing else, sets every API value with
+  `textContent` (never as HTML), and runs under its own CSP that allows only
+  its own script. `console_test.go` holds all three.
 - **`cmd/testnet-setup`** makes the test deployment's sponsor and treasury,
   funded from Friendbot. The treasury is not sponsored, so the
   sponsored-account check does not report it.
