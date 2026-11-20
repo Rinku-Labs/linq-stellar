@@ -1,0 +1,14 @@
+# The worker as its own image, for hosts that ignore a start command on a
+# Docker project (Brimble does) and so would run the Dockerfile's default,
+# the server. The build is the same as Dockerfile's; only the program differs.
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/worker ./cmd/worker
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/worker /usr/local/bin/worker
+CMD ["worker"]
