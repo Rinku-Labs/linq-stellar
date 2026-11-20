@@ -78,6 +78,9 @@ func (s *Server) publicRoutes(mux *http.ServeMux) {
 	// has only a key, and needs to point the reports at a page they control.
 	if s.Chain.NetworkPassphrase() == network.TestNetworkPassphrase {
 		mux.HandleFunc("PUT /v1/webhook", s.requireIntegratorKey(s.handleSetOwnWebhook))
+		// The test console keeps a key in a browser tab, so it is never served
+		// where a key moves real money.
+		s.consoleRoutes(mux)
 	}
 
 	mux.HandleFunc("GET /docs", s.handleDocs)

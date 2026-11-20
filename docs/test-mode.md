@@ -9,6 +9,12 @@ and see it all checked against the ledger.
 test deployment pays no bank: every naira payout is pretend, and says so
 (`payoutReference` starts `fake_`).
 
+**Prefer a browser to a terminal?** Open the test console at
+<https://stellartestmode.brimble.app/console> and sign in with your key. It
+makes the same `/v1` calls as the steps below, shows the exact request to copy,
+follows the order as it moves, and lets you rotate your key, set your webhook
+and try the rate limit. You still pay from your wallet (step 1 and step 4).
+
 ## What you need
 
 - **The API key Linq gave you.** It starts `lq_test_`.
