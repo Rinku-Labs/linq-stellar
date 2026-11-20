@@ -380,6 +380,11 @@ Running it again makes new accounts and secrets: remove the old block from
 Put HTTPS in front of port 8080 before handing out keys, for example Caddy with
 `reverse_proxy localhost:8080`: reviewers send their key with every request.
 
+On a host that ignores a Docker project's start command (Brimble does), the
+worker service runs the image's default, the server, and nothing processes a
+deposit. Build the worker service from `Dockerfile.worker` instead, which
+starts `worker`.
+
 On Koyeb instead: two more services from this repository, like the mainnet
 ones, with their own Postgres and the settings from `.env.testnet.example`. Run
 `testnet-setup` once on your own computer (`go run ./cmd/testnet-setup`) to get
