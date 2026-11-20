@@ -45,3 +45,14 @@ func PruneRateCounters(db *gorm.DB, now time.Time) (int64, error) {
 	result := db.Where("window_start < ?", now.Add(-rateCounterRetention)).Delete(&RateCounter{})
 	return result.RowsAffected, result.Error
 }
+
+// RateCount is a window's count so far, without adding to it: zero if nothing
+// was counted.
+func RateCount(db *gorm.DB, keyID string, windowStart time.Time) (int, error) {
+	var counts []int
+	err := db.Model(&RateCounter{}).Where("key_id = ? AND window_start = ?", keyID, windowStart).Pluck("count", &counts).Error
+	if err != nil || len(counts) == 0 {
+		return 0, err
+	}
+	return counts[0], nil
+}

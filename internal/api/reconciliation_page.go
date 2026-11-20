@@ -20,7 +20,7 @@ import (
 // The reconciliation page is how someone outside Linq, a grant reviewer say,
 // sees the reconciliation engine's work: every cycle, every check, every
 // mismatch and how it was explained. It is read-only and opened with
-// REVIEWER_TOKEN alone.
+// REVIEWER_PASSWORD alone, short enough for a person to type.
 //
 // It reads the reconciliation tables, which were written without any bank
 // detail. The D4 proof page (proof_page.go) also reads orders, through named
@@ -40,6 +40,14 @@ const (
 	stillRunning = time.Hour
 	// reviewerSessionDays is how long a sign-in lasts.
 	reviewerSessionDays = 30
+	// reviewerWrongPerMinute is how many wrong passwords, from anyone, are
+	// checked in a clock minute. After that every attempt is refused until the
+	// minute ends, right or wrong, so a typeable password can't be guessed by
+	// trying them all. Counted across instances, in api_rate_counters.
+	reviewerWrongPerMinute = 10
+	// reviewerWrongKey is the counter's key. API key IDs are UUIDs, so it
+	// can't collide with one.
+	reviewerWrongKey = "reviewer-sign-in"
 )
 
 func (s *Server) reconciliationRoutes(mux *http.ServeMux) {
@@ -62,24 +70,62 @@ func sameSecret(given, want string) bool {
 }
 
 // reviewerSession is what the cookie holds: a MAC of a fixed label under the
-// token. It proves the browser was given the token without keeping the token
-// itself, and stops working the moment REVIEWER_TOKEN is changed.
+// password. It proves the browser was given the password without keeping it, and stops working the moment REVIEWER_PASSWORD is changed.
 func (s *Server) reviewerSession() string {
-	mac := hmac.New(sha256.New, []byte(s.ReviewerToken))
+	mac := hmac.New(sha256.New, []byte(s.ReviewerPassword))
 	mac.Write([]byte("linq-stellar reconciliation reviewer"))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// isReviewer accepts the session cookie, or the token itself as a Bearer
-// header for scripts.
-func (s *Server) isReviewer(r *http.Request) bool {
+// errTooManyWrong refuses a password attempt while the minute's wrong
+// attempts are used up.
+var errTooManyWrong = errors.New("too many wrong passwords")
+
+// checkReviewerPassword is the only place a typed or sent password is
+// compared. Only wrong ones are counted, so a script using the right one is
+// never slowed. If the count can't be read or written the attempt is refused:
+// the limit never silently stops applying.
+func (s *Server) checkReviewerPassword(given string) (bool, error) {
+	window := s.now().Truncate(time.Minute)
+	wrong, err := store.RateCount(s.DB, reviewerWrongKey, window)
+	if err != nil {
+		return false, err
+	}
+	if wrong >= reviewerWrongPerMinute {
+		return false, errTooManyWrong
+	}
+	if sameSecret(given, s.ReviewerPassword) {
+		return true, nil
+	}
+	if _, err := store.HitRateCounter(s.DB, reviewerWrongKey, window); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// isReviewer accepts the session cookie, or the password itself as a Bearer
+// header for scripts. A Bearer header goes through the same limit as the form.
+func (s *Server) isReviewer(r *http.Request) (bool, error) {
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return sameSecret(strings.TrimPrefix(auth, "Bearer "), s.ReviewerToken)
+		return s.checkReviewerPassword(strings.TrimPrefix(auth, "Bearer "))
 	}
 	if c, err := r.Cookie(reviewerCookie); err == nil {
-		return sameSecret(c.Value, s.reviewerSession())
+		return sameSecret(c.Value, s.reviewerSession()), nil
 	}
-	return false
+	return false, nil
+}
+
+// refusedSignIn answers a password that was not checked: too many wrong ones
+// this minute, or a counter that could not be read.
+func (s *Server) refusedSignIn(w http.ResponseWriter, err error) {
+	if errors.Is(err, errTooManyWrong) {
+		s.Log.Warn("reconciliation sign-in refused: too many wrong passwords this minute")
+		w.Header().Set("Retry-After", "60")
+		s.renderPage(w, http.StatusTooManyRequests, signInPage, signInView{Problem: "Too many wrong passwords. Wait a minute and try again."})
+		return
+	}
+	s.Log.Error("could not count a reconciliation sign-in", "error", err)
+	s.renderPage(w, http.StatusServiceUnavailable, signInPage, signInView{Problem: "Sign-in isn't working right now. Try again shortly."})
 }
 
 // pageHeaders keeps the page to itself: no scripts, no framing, nothing
@@ -97,7 +143,12 @@ func pageHeaders(w http.ResponseWriter) {
 func (s *Server) requireReviewer(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		pageHeaders(w)
-		if !s.isReviewer(r) {
+		ok, err := s.isReviewer(r)
+		if err != nil {
+			s.refusedSignIn(w, err)
+			return
+		}
+		if !ok {
 			s.renderPage(w, http.StatusUnauthorized, signInPage, signInView{})
 			return
 		}
@@ -109,17 +160,22 @@ func (s *Server) handleReviewerSignIn(w http.ResponseWriter, r *http.Request) {
 	pageHeaders(w)
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	if err := r.ParseForm(); err != nil {
-		s.renderPage(w, http.StatusBadRequest, signInPage, signInView{Problem: "That could not be read. Paste the token and try again."})
+		s.renderPage(w, http.StatusBadRequest, signInPage, signInView{Problem: "That could not be read. Type the password and try again."})
 		return
 	}
-	if !sameSecret(strings.TrimSpace(r.PostForm.Get("token")), s.ReviewerToken) {
+	ok, err := s.checkReviewerPassword(strings.TrimSpace(r.PostForm.Get("password")))
+	if err != nil {
+		s.refusedSignIn(w, err)
+		return
+	}
+	if !ok {
 		s.Log.Info("reconciliation sign-in refused")
-		s.renderPage(w, http.StatusUnauthorized, signInPage, signInView{Problem: "That token is not right."})
+		s.renderPage(w, http.StatusUnauthorized, signInPage, signInView{Problem: "That password is not right."})
 		return
 	}
 	// Remembered for reviewerSessionDays, so a reviewer opening the page often
-	// isn't asked for a 64-character token each time. The page is read-only and
-	// holds nothing private, and changing REVIEWER_TOKEN ends every session.
+	// isn't asked for the password each time. The page is read-only and holds
+	// nothing private, and changing REVIEWER_PASSWORD ends every session.
 	http.SetCookie(w, &http.Cookie{
 		Name: reviewerCookie, Value: s.reviewerSession(), Path: "/reconciliation",
 		MaxAge:   reviewerSessionDays * 24 * 60 * 60,
@@ -441,12 +497,12 @@ const itemsTableHTML = `{{define "items"}}<div class="scroll"><table>
 
 const signInHTML = `{{define "content"}}<div class="signin">
   <h1>Linq reconciliation</h1>
-  <p class="lead">Every 15 minutes Linq checks its settlement records against the Stellar ledger. Paste the reviewer token you were given to see the results.</p>
+  <p class="lead">Every 15 minutes Linq checks its settlement records against the Stellar ledger. Enter the password you were given to see the results.</p>
   {{if .Problem}}<p class="problem">{{.Problem}}</p>{{end}}
   <form method="post" action="/reconciliation/sign-in">
-    <label for="token">Reviewer token</label>
+    <label for="password">Password</label>
     <input name="username" type="text" value="reviewer" autocomplete="username" hidden>
-    <input id="token" name="token" type="password" autocomplete="current-password" required autofocus>
+    <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
     <button type="submit">Open</button>
   </form>
 </div>{{end}}`

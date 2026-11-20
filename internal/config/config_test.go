@@ -20,21 +20,31 @@ func required(t *testing.T) {
 	}
 }
 
-// The reviewer token is the reconciliation page's only lock, and it is handed
-// to people outside the team.
-func TestAShortReviewerTokenIsRefused(t *testing.T) {
+// The reviewer password is the reconciliation page's only lock, and it is
+// handed to people outside the team.
+func TestAShortReviewerPasswordIsRefused(t *testing.T) {
 	required(t)
-	t.Setenv("REVIEWER_TOKEN", "short")
-	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REVIEWER_TOKEN must be at least 32 characters") {
-		t.Errorf("short token: %v", err)
+	t.Setenv("REVIEWER_PASSWORD", "short")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REVIEWER_PASSWORD must be at least 12 characters") {
+		t.Errorf("short password: %v", err)
 	}
+	t.Setenv("REVIEWER_PASSWORD", "river-maple-42")
+	if c, err := Load(); err != nil || c.ReviewerPassword == "" {
+		t.Errorf("a typeable password: %v", err)
+	}
+	t.Setenv("REVIEWER_PASSWORD", "")
+	if c, err := Load(); err != nil || c.ReviewerPassword != "" {
+		t.Errorf("no password is allowed, and means no page: %v", err)
+	}
+}
+
+// A deployment still on the old name must not start without its page and
+// without saying why.
+func TestTheOldReviewerTokenNameIsRefused(t *testing.T) {
+	required(t)
 	t.Setenv("REVIEWER_TOKEN", strings.Repeat("a", 64))
-	if c, err := Load(); err != nil || c.ReviewerToken == "" {
-		t.Errorf("long token: %v", err)
-	}
-	t.Setenv("REVIEWER_TOKEN", "")
-	if c, err := Load(); err != nil || c.ReviewerToken != "" {
-		t.Errorf("no token is allowed, and means no page: %v", err)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "REVIEWER_TOKEN was renamed REVIEWER_PASSWORD") {
+		t.Errorf("old name: %v", err)
 	}
 }
 

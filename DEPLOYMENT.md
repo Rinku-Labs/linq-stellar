@@ -166,23 +166,22 @@ reconciliation tables, so it has no bank detail to show.
 
 | Variable | Default | What it is |
 |---|---|---|
-| `REVIEWER_TOKEN` | empty | The one secret that opens the page. Empty means the page is not served at all. At least 32 characters, or the server refuses to start. Generate: `openssl rand -hex 32` |
+| `REVIEWER_PASSWORD` | empty | The one secret that opens the page. Empty means the page is not served at all. At least 12 characters, or the server refuses to start. A reviewer types it, so make it easy to type but not guessable: three or four random words and a number. After 10 wrong passwords in a minute, from anyone, sign-in is refused until the minute ends. The old name, `REVIEWER_TOKEN`, stops the server from starting |
 | `PROOF_INTEGRATOR_ID` | empty | The integrator whose orders `/reconciliation/proof` shows as the SCF D4 proof: `linq-v2-b2b`'s ID. Set with `PROOF_SINCE` |
 | `PROOF_SINCE` | empty | When routing was switched on for the business, RFC3339 (`2026-11-09T10:00:00Z`). Earlier orders settled elsewhere and are not shown |
 | `PROOF_BUSINESS_ID` | empty | Optional: only this Linq business's orders (the unaffiliated one) |
 | `PROOF_DEMO_INTEGRATOR_ID` | empty | Optional: the `linq-demo` integrator, whose induced failure demos the page lists |
 
-Give a reviewer the address and the token. They paste the token once; the
-browser keeps a cookie made from it (not the token itself) for 30 days, and a
-password manager can save the token.
-Changing `REVIEWER_TOKEN` signs every reviewer out. A script can send the token
-as a header instead:
+Give a reviewer the address and the password. They type it once; the browser
+keeps a cookie made from it (not the password itself) for 30 days.
+Changing `REVIEWER_PASSWORD` signs every reviewer out. A script can send the
+password as a header instead:
 
 ```bash
-curl $HOST/reconciliation -H "Authorization: Bearer $REVIEWER_TOKEN"
+curl $HOST/reconciliation -H "Authorization: Bearer $REVIEWER_PASSWORD"
 ```
 
-The page does not depend on `PUBLIC_API_ENABLED`, and the token opens nothing
+The page does not depend on `PUBLIC_API_ENABLED`, and the password opens nothing
 else: not `/admin`, not `/v1`, not `/orders`.
 
 Missing variables are all reported at once on the first boot, not one per
@@ -402,7 +401,7 @@ curl -X POST $HOST/admin/integrators/$INTEGRATOR_ID/keys -H "X-Admin-Key: $ADMIN
 The key (`lq_test_...`) is shown only once. Make a second account the same way
 for Linq's own demos.
 
-Then put this deployment's address and its `REVIEWER_TOKEN` in
+Then put this deployment's address and its `REVIEWER_PASSWORD` in
 `docs/test-mode.md`, where it says so, and give the reviewer the key.
 
 This deployment is separate from mainnet in every way: never point it at the

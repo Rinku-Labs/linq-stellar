@@ -144,9 +144,9 @@ func TestSetupMakesATestDeploymentThatStarts(t *testing.T) {
 		t.Fatalf("the test deployment would not start: %v", err)
 	}
 	if c.PayoutProvider != config.PayoutProviderFake || c.NetworkPassphrase != network.TestNetworkPassphrase ||
-		c.TestRateNGN <= 0 || len(c.ReviewerToken) < 32 || !c.PublicAPIEnabled || len(c.AdminAPIKey) < 32 {
+		c.TestRateNGN <= 0 || len(c.ReviewerPassword) < 32 || !c.PublicAPIEnabled || len(c.AdminAPIKey) < 32 {
 		t.Errorf("config: provider %q, network %q, rate %v, reviewer token %d chars, public API %v",
-			c.PayoutProvider, c.NetworkPassphrase, c.TestRateNGN, len(c.ReviewerToken), c.PublicAPIEnabled)
+			c.PayoutProvider, c.NetworkPassphrase, c.TestRateNGN, len(c.ReviewerPassword), c.PublicAPIEnabled)
 	}
 	if strings.Contains(progress.String(), sponsor.Seed()) {
 		t.Error("the sponsor's secret was written to the progress output")
